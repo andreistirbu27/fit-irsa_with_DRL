@@ -10,6 +10,8 @@ from tqdm import tqdm
 import shutil
 import glob
 
+
+
 try:
     import gzip
 except ImportError:
@@ -23,8 +25,9 @@ DEFAULT_KEEP_LAST_MODELS = 2
 
 def parse_args():
     parser = argparse.ArgumentParser(description="IRSA 2-Phases Training")
-    parser.add_argument('--users', type=int, default=15)
-    parser.add_argument('--slots', type=int, default=9)
+    parser.add_argument('--users', type=int, default=4, help='Number of users (required)')
+    parser.add_argument('--slots', type=int, default=2, help='Number of slots (required)')
+    parser.add_argument('--torch-single-core', default=False, action="store_true") 
     parser.add_argument('--input-obs-dim', type=int, default=3)
     parser.add_argument('--hidden-dim', type=int, default=DEFAULT_HIDDEN_DIM)
     parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS)
@@ -34,6 +37,7 @@ def parse_args():
     parser.add_argument('--epoch-save-interval', type=int, default=200, help='Save model every N epochs')
     parser.add_argument('--result-dir', type=str, default=None, help='Override result dir')
     parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS, help='Keep only the last X saved models (default=2)')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed (optional)')
     return parser.parse_args()
 
 def make_result_dir(cfg):
@@ -53,6 +57,8 @@ def make_result_dir(cfg):
             parts.append(f"b{cfg['batch_size']}")
         if cfg['learning_rate'] != DEFAULT_LEARNING_RATE:
             parts.append(f"lr{cfg['learning_rate']}")
+        if cfg.get('seed', None) is not None:
+            parts.append(f"seed{cfg['seed']}")
         result_dir = "-".join(parts)
     os.makedirs(result_dir, exist_ok=True)
     return result_dir
@@ -166,12 +172,38 @@ def load_model_from_dir(result_dir, which="final", device=None):
     model.eval()
     return model, cfg
 
+
+
+
 def main():
     args = parse_args()
+
+    # Enforce --users and --slots (should be handled by argparse 'required', but double-check)
+    if args.users is None:
+        print("Error: --users is required.", file=sys.stderr)
+        sys.exit(1)
+    if args.slots is None:
+        print("Error: --slots is required.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.torch_single_core:
+        torch.set_num_threads(1)
+        #torch.set_num_interop_threads(1)
+
+    # Set random seed if provided
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        try:
+            import random
+            random.seed(args.seed)
+        except ImportError:
+            pass
+
     # Put all config in a dictionary
     cfg = {
-        'num_users': args.num_users,
-        'num_slots': args.num_slots,
+        'num_users': args.users,
+        'num_slots': args.slots,
         'input_obs_dim': args.input_obs_dim,
         'hidden_dim': args.hidden_dim,
         'epochs': args.epochs,
@@ -181,6 +213,7 @@ def main():
         'epoch_save_interval': args.epoch_save_interval,
         'result_dir': args.result_dir,
         'keep_last_models': args.keep_last_models,
+        'seed': args.seed,
     }
 
     # Derived dims
@@ -223,6 +256,20 @@ def main():
         lp = d.log_prob(a).sum()  # scalar log-prob for this user
         slots = torch.where(a == 1)[0].tolist()
         return (len(slots), slots), lp, a  # (r,[slots]), logprob, tensor
+
+    #import torch.nn.functional as F
+
+    #def sample_actions_user_fast(logits_user: torch.Tensor):
+    #    # logits_user: 1D float tensor [num_slots]
+    #    probs = torch.sigmoid(logits_user)             # σ(logits)
+    #    a = torch.bernoulli(probs)                     # float {0.,1.}
+    #    # log p(a | logits) = -BCEWithLogits(a, logits)
+    #    lp = -F.binary_cross_entropy_with_logits(logits_user, a, reduction='sum')
+    #    idx = a.nonzero(as_tuple=True)[0]              # indices where a==1
+    #
+    #    # Prefer returning tensors (avoids Python list conversion cost):
+    #    return (idx.numel(), idx), lp, a
+
 
     # === SIC + feedback (decoded slots are those that became empty after SIC but were non-empty initially) ===
     def run_sic_simulation(actions, return_feedback_indices=False):
@@ -410,4 +457,5 @@ def main():
     save_model(policy, result_dir, epoch=None)
 
 if __name__ == "__main__":
+    main()
     main()
