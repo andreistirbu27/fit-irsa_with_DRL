@@ -23,8 +23,8 @@ DEFAULT_KEEP_LAST_MODELS = 2
 
 def parse_args():
     parser = argparse.ArgumentParser(description="IRSA 2-Phases Training")
-    parser.add_argument('--num-users', type=int, default=15)
-    parser.add_argument('--num-slots', type=int, default=9)
+    parser.add_argument('--users', type=int, default=15)
+    parser.add_argument('--slots', type=int, default=9)
     parser.add_argument('--input-obs-dim', type=int, default=3)
     parser.add_argument('--hidden-dim', type=int, default=DEFAULT_HIDDEN_DIM)
     parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS)
