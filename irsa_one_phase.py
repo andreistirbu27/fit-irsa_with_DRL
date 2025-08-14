@@ -46,7 +46,7 @@ def make_result_dir(cfg):
         result_dir = cfg['result_dir']
     else:
         parts = [
-            f"result-u{cfg['num_users']}",
+            f"res-plain-u{cfg['num_users']}",
             f"s{cfg['num_slots']}"
         ]
         if cfg['hidden_dim'] != DEFAULT_HIDDEN_DIM:

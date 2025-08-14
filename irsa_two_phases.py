@@ -48,7 +48,7 @@ def make_result_dir(cfg):
     else:
         # Only include non-defaults for hidden-dim, epochs, batch-size, learning-rate
         parts = [
-            f"result-u{cfg['num_users']}",
+            f"res-u{cfg['num_users']}",
             f"s{cfg['num_slots']}"
         ]
         if cfg['hidden_dim'] != DEFAULT_HIDDEN_DIM:
