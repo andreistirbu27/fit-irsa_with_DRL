@@ -273,7 +273,7 @@ def sic_decode(actions, total_slots):
 # === Training (apply policy per user) ===
 def train(policy, optimizer, cfg,
           sparsity_r1_max=0.02, sparsity_r2_max=0.01,
-          warmup_r1=400, warmup_r2=800):
+          warmup_r1=400, warmup_r2=800, log_file=None):
     reward_history = []
     avg_unique_history = []
     frac_decR1_txR2_hist = []  # fraction: R1-decoded who still tx in R2
@@ -391,6 +391,11 @@ def train(policy, optimizer, cfg,
         avg_unique_history.append(np.mean(batch_uniques))
         frac_decR1_txR2_hist.append(np.nanmean(batch_frac_decR1_txR2))
 
+        # optional logging
+        if log_file is not None:
+            rec = {"epoch": epoch, "decoded_array": batch_uniques}
+            print(json.dumps(rec), file=log_file, flush=True)
+
         if epoch % 100 == 0:
             print(f"Epoch {epoch}: "
                   f"Avg Reward={baseline:.3f}, "
@@ -456,15 +461,19 @@ def main():
         json.dump(cfg, f, indent=2)
 
     # Open log file
-    log_f, log_path = get_log_file(result_dir, cfg['compress'])
+    if args.log:
+        log_f, log_path = get_log_file(result_dir, cfg['compress'])
+    else:
+        log_f, log_path = None, None
 
     # === Run ===
     policy = PolicyNetUser(input_dim, cfg['hidden_dim'], cfg['num_slots'])
     optimizer = optim.Adam(policy.parameters(), lr=cfg['learning_rate'])
     try:
-        rewards, avg_unique, frac_decR1_txR2 = train(policy, optimizer, cfg)
+        rewards, avg_unique, frac_decR1_txR2 = train(policy, optimizer, cfg, log_file=log_f)
     finally:
-        log_f.close()
+        if log_f is not None:
+            log_f.close()
 
     # Save final model
     save_model(policy, result_dir, epoch=None)
