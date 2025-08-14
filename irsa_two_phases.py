@@ -22,6 +22,7 @@ DEFAULT_EPOCHS = 2000
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_LEARNING_RATE = 0.01
 DEFAULT_KEEP_LAST_MODELS = 2
+DEFAULT_SEED = 1000
 
 def parse_args():
     parser = argparse.ArgumentParser(description="IRSA 2-Phases Training")
@@ -34,10 +35,11 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument('--learning-rate', type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument('--compress', action='store_true', help='Compress log file with gzip')
+    parser.add_argument('--log', action='store_true')
     parser.add_argument('--epoch-save-interval', type=int, default=200, help='Save model every N epochs')
     parser.add_argument('--result-dir', type=str, default=None, help='Override result dir')
     parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS, help='Keep only the last X saved models (default=2)')
-    parser.add_argument('--seed', type=int, default=None, help='Random seed (optional)')
+    parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help='Random seed (default=1)')
     return parser.parse_args()
 
 def make_result_dir(cfg):
@@ -57,8 +59,9 @@ def make_result_dir(cfg):
             parts.append(f"b{cfg['batch_size']}")
         if cfg['learning_rate'] != DEFAULT_LEARNING_RATE:
             parts.append(f"lr{cfg['learning_rate']}")
-        if cfg.get('seed', None) is not None:
-            parts.append(f"seed{cfg['seed']}")
+        # Only add seed if it is not the default
+        if cfg.get('seed', DEFAULT_SEED) != DEFAULT_SEED:
+            parts.append(f"s{cfg['seed']}")
         result_dir = "-".join(parts)
     os.makedirs(result_dir, exist_ok=True)
     return result_dir
@@ -480,4 +483,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
