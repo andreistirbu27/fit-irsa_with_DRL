@@ -333,8 +333,10 @@ def main():
             avg_decoded_history.append(np.mean(batch_decoded))
 
             # optional logging
-            # rec = {"epoch": epoch, "reward": float(baseline), "avg_decoded": float(avg_decoded_history[-1]), "activity": last_activity, "lambda": lam}
-            # print(json.dumps(rec), file=log_f, flush=True)
+            #rec = {"epoch": epoch, "reward": float(baseline), "avg_decoded": float(avg_decoded_history[-1]), "activity": last_activity, "lambda": lam}
+            if args.log:
+                rec = {"epoch": epoch, "decoded_array": batch_decoded}            
+                print(json.dumps(rec), file=log_f, flush=True)
 
             if epoch % 100 == 0:
                 print(f"Epoch {epoch}: "
