@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument('--learning-rate', type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument('--compress', action='store_true', help='Compress log file with gzip')
     parser.add_argument('--log', action='store_true')
+    parser.add_argument('--prefix', type=str, default="")
     parser.add_argument('--epoch-save-interval', type=int, default=200, help='Save model every N epochs')
     parser.add_argument('--result-dir', type=str, default=None, help='Override result dir')
     parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS, help='Keep only the last X saved models (default=2)')
@@ -43,12 +44,15 @@ def parse_args():
     return parser.parse_args()
 
 def make_result_dir(cfg):
+    base = "res"
+    if cfg["prefix"] is not None and cfg["prefix"] != "":
+        base += "-"+cfg["prefix"]
     if cfg['result_dir'] is not None:
         result_dir = cfg['result_dir']
     else:
         # Only include non-defaults for hidden-dim, epochs, batch-size, learning-rate
         parts = [
-            f"res-u{cfg['num_users']}",
+            f"{base}-u{cfg['num_users']}",
             f"s{cfg['num_slots']}"
         ]
         if cfg['hidden_dim'] != DEFAULT_HIDDEN_DIM:
@@ -445,6 +449,7 @@ def main():
         'result_dir': args.result_dir,
         'keep_last_models': args.keep_last_models,
         'seed': args.seed,
+        'prefix': args.prefix
     }
 
     # Derived dims
