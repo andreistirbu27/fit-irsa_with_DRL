@@ -3,8 +3,8 @@
 # Use the first argument as seed if provided, else default to 1
 seed="${1:-1}"
 
-tsp -S 32
-for users in $(seq 1 20); do
+tsp -S 64
+for users in $(seq 2 2 30); do
     slots=$(( (users+1)/2 ))
     tsp python irsa_two_phases.py \
         --slots "$slots" \
@@ -12,6 +12,10 @@ for users in $(seq 1 20); do
         --torch-single-core \
         --seed "$seed" \
         --log \
-        --compress
+	--batch-size 1000 \
+	--epochs 1000 \
+        --epoch-half-lr-interval 100 \
+	--epoch-save-interval 100 \
+	--keep-last-models 100
 done
 
