@@ -10,8 +10,6 @@ from tqdm import tqdm
 import shutil
 import glob
 
-
-
 try:
     import gzip
 except ImportError:
@@ -41,6 +39,7 @@ def parse_args():
     parser.add_argument('--result-dir', type=str, default=None, help='Override result dir')
     parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS, help='Keep only the last X saved models (default=2)')
     parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help='Random seed (default=1)')
+    parser.add_argument('--gpu', action='store_true', help='Use GPU (cuda or mps) if available')
     return parser.parse_args()
 
 def make_result_dir(cfg):
@@ -277,7 +276,7 @@ def sic_decode(actions, total_slots):
 # === Training (apply policy per user) ===
 def train(policy, optimizer, cfg,
           sparsity_r1_max=0.02, sparsity_r2_max=0.01,
-          warmup_r1=400, warmup_r2=800, log_file=None):
+          warmup_r1=400, warmup_r2=800, log_file=None, device=None):
     reward_history = []
     avg_unique_history = []
     frac_decR1_txR2_hist = []  # fraction: R1-decoded who still tx in R2
@@ -306,7 +305,7 @@ def train(policy, optimizer, cfg,
 
         for _ in range(batch_size):
             # per-user noise (keep or share, your call)
-            obs_all = [torch.rand(input_obs_dim) for _ in range(num_users)]
+            obs_all = [torch.rand(input_obs_dim, device=device) for _ in range(num_users)]
 
             # -------- Round 1: per-user policy (feedback=0, prev_action=zeros) --------
             actions_r1, acts_bin_r1 = [], []
@@ -314,8 +313,8 @@ def train(policy, optimizer, cfg,
             for u in range(num_users):
                 x1 = torch.cat([
                     obs_all[u],
-                    torch.zeros(feedback_dim),  # no feedback yet
-                    torch.zeros(prev_action_dim)  # no previous action yet
+                    torch.zeros(feedback_dim, device=device),  # no feedback yet
+                    torch.zeros(prev_action_dim, device=device)  # no previous action yet
                 ], dim=0)
                 assert x1.numel() == input_dim
                 logits_u = policy(x1)  # [num_slots]
@@ -329,7 +328,7 @@ def train(policy, optimizer, cfg,
             decoded_r1, fb_idx = run_sic_simulation(actions_r1, num_slots, return_feedback_indices=True)
 
             # -------- Round 2: per-user policy (feedback + prev_action from R1) --------
-            fb_vec = feedback_indices_to_vector(fb_idx, num_slots)  # len = 3*num_slots
+            fb_vec = feedback_indices_to_vector(fb_idx, num_slots).to(device)  # len = 3*num_slots
             actions_r2, acts_bin_r2 = [], []
             lp_r2_total = 0.0
             for u in range(num_users):
@@ -435,6 +434,20 @@ def main():
         except ImportError:
             pass
 
+    # Device selection
+    if args.gpu:
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            print("Using CUDA GPU.")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+            print("Using Apple MPS GPU.")
+        else:
+            device = torch.device("cpu")
+            print("GPU requested but not available, using CPU.")
+    else:
+        device = torch.device("cpu")
+
     # Put all config in a dictionary
     cfg = {
         'num_users': args.users,
@@ -472,10 +485,10 @@ def main():
         log_f, log_path = None, None
 
     # === Run ===
-    policy = PolicyNetUser(input_dim, cfg['hidden_dim'], cfg['num_slots'])
+    policy = PolicyNetUser(input_dim, cfg['hidden_dim'], cfg['num_slots']).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=cfg['learning_rate'])
     try:
-        rewards, avg_unique, frac_decR1_txR2 = train(policy, optimizer, cfg, log_file=log_f)
+        rewards, avg_unique, frac_decR1_txR2 = train(policy, optimizer, cfg, log_file=log_f, device=device)
     finally:
         if log_f is not None:
             log_f.close()
