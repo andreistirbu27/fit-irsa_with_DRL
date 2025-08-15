@@ -469,12 +469,6 @@ def train(policy, optimizer, cfg,
             # feedback from Round 1
             decoded_r1, fb_idx = run_sic_simulation(actions_r1, num_slots, return_feedback_indices=True)
 
-            # -------- Round 2: per-user policy (feedback + prev_action from R1) --------
-            fb_vec = feedback_indices_to_vector(fb_idx, num_slots).to(device)  # len = 3*num_slots
-            actions_r2, acts_bin_r2, entropy_r2, lp_r2_total = round2_actions(
-                policy, obs_all, acts_bin_r1, fb_vec, num_users, input_dim, device
-            )
-
             # -------- Round 2 (optional): per-user policy --------
             if not one_phase:
                 fb_vec = feedback_indices_to_vector(fb_idx, num_slots).to(device)  # len = 3*num_slots
