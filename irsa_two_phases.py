@@ -44,6 +44,7 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help='Random seed (default=1)')
     parser.add_argument('--gpu', action='store_true', help='Use GPU (cuda or mps) if available')
     parser.add_argument('--epoch-half-lr-interval', type=int, default=None, help='If set, halve learning rate every N epochs')
+    parser.add_argument('--one-phase', action='store_true', help='Run only Round 1 (Round 2 disabled; equivalent to 0 slots in phase 2)')
     args = parser.parse_args()
     # --log-action implies --log
     if getattr(args, "log_action", False):
@@ -54,6 +55,9 @@ def make_result_dir(cfg):
     base = "res"
     if cfg["prefix"] is not None and cfg["prefix"] != "":
         base += "-"+cfg["prefix"]
+    if cfg.get('one_phase', False):
+        base += "-1p"
+
     if cfg['result_dir'] is not None:
         result_dir = cfg['result_dir']
     else:
@@ -415,6 +419,7 @@ def train(policy, optimizer, cfg,
     input_dim = input_obs_dim + feedback_dim + prev_action_dim
 
     log_action = cfg.get('log_action', False)
+    one_phase = cfg.get('one_phase', False)
 
     # Learning rate halving support
     epoch_half_lr_interval = cfg.get('epoch_half_lr_interval', None)
@@ -470,29 +475,49 @@ def train(policy, optimizer, cfg,
                 policy, obs_all, acts_bin_r1, fb_vec, num_users, input_dim, device
             )
 
+            # -------- Round 2 (optional): per-user policy --------
+            if not one_phase:
+                fb_vec = feedback_indices_to_vector(fb_idx, num_slots).to(device)  # len = 3*num_slots
+                actions_r2, acts_bin_r2, entropy_r2, lp_r2_total = round2_actions(
+                    policy, obs_all, acts_bin_r1, fb_vec, num_users, input_dim, device
+                )
+            else:
+                # Phase 2 disabled: no transmissions in R2
+                actions_r2 = [(0, []) for _ in range(num_users)]
+                acts_bin_r2 = torch.zeros(num_users, num_slots, device=device)
+                entropy_r2 = [torch.tensor(0.0, device=device) for _ in range(num_users)]
+                lp_r2_total = torch.tensor(0.0, device=device)
+
             # -------- CONCATENATE schedules and decode ONCE --------
             # Map Round-2 slots to [num_slots .. 2*num_slots-1], keep R1 as [0 .. num_slots-1]
             actions_concat = []
             for u in range(num_users):
                 r1, s1 = actions_r1[u]
+                #r2, s2 = actions_r2[u]
+                #s2_off = [s + num_slots for s in s2]
+                #combined = s1 + s2_off
                 r2, s2 = actions_r2[u]
-                s2_off = [s + num_slots for s in s2]
-                combined = s1 + s2_off
+                if one_phase:
+                    combined = s1
+                else:
+                    s2_off = [s + num_slots for s in s2]
+                    combined = s1 + s2_off
                 actions_concat.append((len(combined), combined))
 
-            decoded_concat = sic_decode(actions_concat, total_slots=2 * num_slots)
+            total_slots_concat = num_slots if one_phase else (2 * num_slots)
+            decoded_concat = sic_decode(actions_concat, total_slots=total_slots_concat)
             num_decoded_concat = len(decoded_concat)
             reward = num_decoded_concat / num_users
 
             # -------------- Ramped sparsity in BOTH rounds  --------------
             r1_activity = acts_bin_r1.float().mean().item()
-            r2_activity = acts_bin_r2.float().mean().item()
+            r2_activity = acts_bin_r2.float().mean().item() if not one_phase else 0.0
             reward -= lam_r1 * r1_activity
             reward -= lam_r2 * r2_activity
             last_r1_act, last_r2_act = r1_activity, r2_activity
 
             # -------- Metric: frac(R1-decoded who transmit in R2) --------
-            if len(decoded_r1) > 0:
+            if (len(decoded_r1) > 0) and (not one_phase):
                 mask_dec = torch.zeros(num_users, dtype=torch.bool)
                 mask_dec[list(decoded_r1)] = True
                 r2_any = (acts_bin_r2.sum(dim=1) > 0)  # per-user bool
@@ -608,7 +633,8 @@ def main():
         'seed': args.seed,
         'prefix': args.prefix,
         'log_action': getattr(args, "log_action", False),
-        'epoch_half_lr_interval': getattr(args, "epoch_half_lr_interval", None)
+        'epoch_half_lr_interval': getattr(args, "epoch_half_lr_interval", None),
+        'one_phase': getattr(args, 'one_phase', False)
     }
 
     # Derived dims
