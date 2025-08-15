@@ -9,6 +9,7 @@ import sys
 from tqdm import tqdm
 import shutil
 import glob
+import math
 
 try:
     import gzip
@@ -204,7 +205,9 @@ def sample_actions_user(logits_user):
     a = d.sample()  # [num_slots] {0,1}
     lp = d.log_prob(a).sum()  # scalar log-prob for this user
     slots = torch.where(a == 1)[0].tolist()
-    return (len(slots), slots), lp, a  # (r,[slots]), logprob, tensor
+    with torch.no_grad():
+        ent_bits_mean = d.entropy().mean() / math.log(2.0)
+    return (len(slots), slots), lp, a, ent_bits_mean  # (r,[slots]), logprob, tensor
 
 # === SIC + feedback (decoded slots are those that became empty after SIC but were non-empty initially) ===
 def run_sic_simulation(actions, num_slots, return_feedback_indices=False):
@@ -302,13 +305,15 @@ def train(policy, optimizer, cfg,
         batch_rewards, batch_log_probs, batch_uniques = [], [], []
         batch_frac_decR1_txR2 = []
         last_r1_act, last_r2_act = 0.0, 0.0
+        batch_entropy_r1 = []
+        batch_entropy_r2 = []
 
         for _ in range(batch_size):
             # per-user noise (keep or share, your call)
             obs_all = [torch.rand(input_obs_dim, device=device) for _ in range(num_users)]
 
             # -------- Round 1: per-user policy (feedback=0, prev_action=zeros) --------
-            actions_r1, acts_bin_r1 = [], []
+            actions_r1, acts_bin_r1, entropy_r1 = [], [], []
             lp_r1_total = 0.0
             for u in range(num_users):
                 x1 = torch.cat([
@@ -318,9 +323,10 @@ def train(policy, optimizer, cfg,
                 ], dim=0)
                 assert x1.numel() == input_dim
                 logits_u = policy(x1)  # [num_slots]
-                cw_u, lp_u, a_u = sample_actions_user(logits_u)  # a_u: [num_slots] in {0,1}
+                cw_u, lp_u, a_u, e_u = sample_actions_user(logits_u)  # a_u: [num_slots] in {0,1}
                 actions_r1.append(cw_u)
                 acts_bin_r1.append(a_u)
+                entropy_r1.append(e_u)
                 lp_r1_total = lp_r1_total + lp_u
             acts_bin_r1 = torch.stack(acts_bin_r1, dim=0)  # [num_users, num_slots]
 
@@ -329,7 +335,7 @@ def train(policy, optimizer, cfg,
 
             # -------- Round 2: per-user policy (feedback + prev_action from R1) --------
             fb_vec = feedback_indices_to_vector(fb_idx, num_slots).to(device)  # len = 3*num_slots
-            actions_r2, acts_bin_r2 = [], []
+            actions_r2, acts_bin_r2, entropy_r2 = [], [], []
             lp_r2_total = 0.0
             for u in range(num_users):
                 prev_act_u = acts_bin_r1[u].float()  # THIS user's R1 action (0/1 per slot)
@@ -340,9 +346,10 @@ def train(policy, optimizer, cfg,
                 ], dim=0)
                 assert x2.numel() == input_dim
                 logits_u = policy(x2)
-                cw_u, lp_u, a_u = sample_actions_user(logits_u)
+                cw_u, lp_u, a_u, e_u = sample_actions_user(logits_u)
                 actions_r2.append(cw_u)
                 acts_bin_r2.append(a_u)
+                entropy_r2.append(e_u)
                 lp_r2_total = lp_r2_total + lp_u
             acts_bin_r2 = torch.stack(acts_bin_r2, dim=0)  # [num_users, num_slots]
 
@@ -381,6 +388,8 @@ def train(policy, optimizer, cfg,
             batch_log_probs.append(lp_r1_total + lp_r2_total)
             batch_uniques.append(num_decoded_concat)
             batch_frac_decR1_txR2.append(frac_decR1_txR2)
+            batch_entropy_r1.append(torch.stack(entropy_r1))
+            batch_entropy_r2.append(torch.stack(entropy_r2))
 
         # REINFORCE with baseline
         baseline = np.mean(batch_rewards)
@@ -396,7 +405,17 @@ def train(policy, optimizer, cfg,
 
         # optional logging
         if log_file is not None:
-            rec = {"epoch": epoch, "decoded_array": batch_uniques}
+            all_entropy_r1 = torch.stack(batch_entropy_r1)
+            all_entropy_r2 = torch.stack(batch_entropy_r2)
+            rec = {
+                "epoch": epoch, 
+                "decoded_array": batch_uniques, 
+                "entropy_r1_mean": all_entropy_r1.mean().item(),
+                "entropy_r2_mean": all_entropy_r2.mean().item(),
+                "entropy_r1_std_dev": all_entropy_r1.std().item(),
+                "entropy_r2_std_dev": all_entropy_r2.std().item(),
+            }
+            print({k:(v if k != "decoded_array" else np.array(v).mean()) for k,v in rec.items() } )
             print(json.dumps(rec), file=log_file, flush=True)
 
         if epoch % 100 == 0:
