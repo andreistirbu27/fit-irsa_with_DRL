@@ -35,13 +35,18 @@ def parse_args():
     parser.add_argument('--learning-rate', type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument('--compress', action='store_true', help='Compress log file with gzip')
     parser.add_argument('--log', action='store_true')
+    parser.add_argument('--log-action', action='store_true', help='Log all actions of all users in each sample of the batch (r1 and r2); implies --log')
     parser.add_argument('--prefix', type=str, default="")
     parser.add_argument('--epoch-save-interval', type=int, default=200, help='Save model every N epochs')
     parser.add_argument('--result-dir', type=str, default=None, help='Override result dir')
     parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS, help='Keep only the last X saved models (default=2)')
     parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help='Random seed (default=1)')
     parser.add_argument('--gpu', action='store_true', help='Use GPU (cuda or mps) if available')
-    return parser.parse_args()
+    args = parser.parse_args()
+    # --log-action implies --log
+    if getattr(args, "log_action", False):
+        args.log = True
+    return args
 
 def make_result_dir(cfg):
     base = "res"
@@ -293,6 +298,8 @@ def train(policy, optimizer, cfg,
     prev_action_dim = num_slots
     input_dim = input_obs_dim + feedback_dim + prev_action_dim
 
+    log_action = cfg.get('log_action', False)
+
     for epoch in tqdm(range(epochs), desc="Training", unit="epoch"):
         # ramped sparsity weights
         lam_r1 = sparsity_r1_max * min(1.0, epoch / float(warmup_r1))
@@ -307,6 +314,10 @@ def train(policy, optimizer, cfg,
         last_r1_act, last_r2_act = 0.0, 0.0
         batch_entropy_r1 = []
         batch_entropy_r2 = []
+
+        # For --log-action: collect all actions for this batch
+        batch_actions_r1 = []
+        batch_actions_r2 = []
 
         for _ in range(batch_size):
             # per-user noise (keep or share, your call)
@@ -391,6 +402,22 @@ def train(policy, optimizer, cfg,
             batch_entropy_r1.append(torch.stack(entropy_r1))
             batch_entropy_r2.append(torch.stack(entropy_r2))
 
+            # For --log-action: store actions for this sample
+            if log_action:
+                # actions_r1 and actions_r2 are lists of (r, [slots]) for each user
+                # Store as list of dicts for each user
+                sample_actions_r1 = []
+                sample_actions_r2 = []
+                for u in range(num_users):
+                    r1, s1 = actions_r1[u]
+                    r2, s2 = actions_r2[u]
+                    #sample_actions_r1.append({"user": u, "r": r1, "slots": s1})
+                    #sample_actions_r2.append({"user": u, "r": r2, "slots": s2})
+                    sample_actions_r1.append(s1)
+                    sample_actions_r2.append(s2)
+                batch_actions_r1.append(sample_actions_r1)
+                batch_actions_r2.append(sample_actions_r2)
+
         # REINFORCE with baseline
         baseline = np.mean(batch_rewards)
         total_loss = sum([-(r - baseline) * lp for r, lp in zip(batch_rewards, batch_log_probs)])
@@ -415,7 +442,32 @@ def train(policy, optimizer, cfg,
                 "entropy_r1_std_dev": all_entropy_r1.std().item(),
                 "entropy_r2_std_dev": all_entropy_r2.std().item(),
             }
-            print({k:(v if k != "decoded_array" else np.array(v).mean()) for k,v in rec.items() } )
+
+            # rec["actions_r1"] and rec["actions_r2"] are lists of lists of slot indices
+            # Outer list: batch, inner list: users, value: list of slots for that user
+            nb_slots1 = np.array([len(slots) for frame in batch_actions_r1 for slots in frame])
+            nb_slots2 = np.array([len(slots) for frame in batch_actions_r2 for slots in frame])
+            
+            #info["nb_slots"] = list(sorted([int(x) for x in np.concatenate([nb_slots1, nb_slots2])]))
+            total_slots = (nb_slots1+nb_slots2)
+            # Compute histogram of total_slots (dict: value: counts)
+            # total_slots is a numpy array of total slots per user per batch
+            unique, counts = np.unique(total_slots, return_counts=True)
+            histogram = dict(zip([int(u) for u in unique], [int(c) for c in counts]))
+            rec["total_slots_histogram"] = histogram
+
+
+            # If --log-action, add actions to the log record
+            if log_action:
+                rec["actions_r1"] = batch_actions_r1
+                rec["actions_r2"] = batch_actions_r2
+
+            excluded_keys = ["decoded_array", "actions_r1", "actions_r2"]
+            info = {k: v for k, v in rec.items() if k not in excluded_keys}
+            info["decoded_mean"] = np.array(rec["decoded_array"]).mean()
+
+            status = str(info) # json.dumps(info)
+            tqdm.write(status)
             print(json.dumps(rec), file=log_file, flush=True)
 
         if epoch % 100 == 0:
@@ -481,7 +533,8 @@ def main():
         'result_dir': args.result_dir,
         'keep_last_models': args.keep_last_models,
         'seed': args.seed,
-        'prefix': args.prefix
+        'prefix': args.prefix,
+        'log_action': getattr(args, "log_action", False)
     }
 
     # Derived dims
