@@ -10,6 +10,7 @@ from tqdm import tqdm
 import shutil
 import glob
 import math
+import time  # <-- Added for timing
 
 try:
     import gzip
@@ -328,7 +329,7 @@ def compute_reinforce_loss(batch_rewards, batch_log_probs, optimizer):
     optimizer.step()
     return baseline
 
-def log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_actions_r1, batch_actions_r2, log_action, log_file):
+def log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_actions_r1, batch_actions_r2, log_action, log_file, timing_info=None):
     all_entropy_r1 = torch.stack(batch_entropy_r1)
     all_entropy_r2 = torch.stack(batch_entropy_r2)
     rec = {
@@ -339,25 +340,61 @@ def log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_ac
         "entropy_r1_std_dev": all_entropy_r1.std().item(),
         "entropy_r2_std_dev": all_entropy_r2.std().item(),
     }
-
     nb_slots1 = np.array([len(slots) for frame in batch_actions_r1 for slots in frame])
     nb_slots2 = np.array([len(slots) for frame in batch_actions_r2 for slots in frame])
-    total_slots = (nb_slots1 + nb_slots2)
-    unique, counts = np.unique(total_slots, return_counts=True)
-    histogram = dict(zip([int(u) for u in unique], [int(c) for c in counts]))
-    rec["total_slots_histogram"] = histogram
+    total_slots = nb_slots1 + nb_slots2
+
+    # Histogram for total slots (R1 + R2)
+    unique_total, counts_total = np.unique(total_slots, return_counts=True)
+    histogram_total = dict(zip([int(u) for u in unique_total], [int(c) for c in counts_total]))
+    rec["total_slots_histogram"] = histogram_total
+
+    # Histogram for R1 only
+    unique_r1, counts_r1 = np.unique(nb_slots1, return_counts=True)
+    histogram_r1 = dict(zip([int(u) for u in unique_r1], [int(c) for c in counts_r1]))
+    rec["r1_slots_histogram"] = histogram_r1
+
+    # Histogram for R2 only
+    unique_r2, counts_r2 = np.unique(nb_slots2, return_counts=True)
+    histogram_r2 = dict(zip([int(u) for u in unique_r2], [int(c) for c in counts_r2]))
+    rec["r2_slots_histogram"] = histogram_r2
 
     if log_action:
         rec["actions_r1"] = batch_actions_r1
         rec["actions_r2"] = batch_actions_r2
 
-    excluded_keys = ["decoded_array", "actions_r1", "actions_r2"]
+    # Add timing info if provided
+    if timing_info is not None:
+        rec.update(timing_info)
+
+    excluded_keys = ["decoded_array", "actions_r1", "actions_r2", "r1_slots_histogram", "r2_slots_histogram", "total_slots_histogram"]
     info = {k: v for k, v in rec.items() if k not in excluded_keys}
     info["decoded_mean"] = np.array(rec["decoded_array"]).mean()
 
-    status = str(info) # json.dumps(info)
+    # Format floats in info to 3 decimal digits
+    def format_floats(d):
+        if isinstance(d, dict):
+            return {k: format_floats(v) for k, v in d.items()}
+        elif isinstance(d, float):
+            return float(f"{d:.3f}")
+        elif isinstance(d, list):
+            return [format_floats(x) for x in d]
+        else:
+            return d
+    status = str(format_floats(info))
     tqdm.write(status)
     print(json.dumps(rec), file=log_file, flush=True)
+
+def store_sample_actions(actions_r1, actions_r2, num_users):
+    sample_actions_r1 = []
+    sample_actions_r2 = []
+    for u in range(num_users):
+        r1, s1 = actions_r1[u]
+        r2, s2 = actions_r2[u]
+        sample_actions_r1.append(s1)
+        sample_actions_r2.append(s2)
+    return sample_actions_r1, sample_actions_r2
+
 
 # === Training (apply policy per user) ===
 def train(policy, optimizer, cfg,
@@ -379,6 +416,8 @@ def train(policy, optimizer, cfg,
     log_action = cfg.get('log_action', False)
 
     for epoch in tqdm(range(epochs), desc="Training", unit="epoch"):
+        epoch_start_time = time.time()
+
         # ramped sparsity weights
         lam_r1 = sparsity_r1_max * min(1.0, epoch / float(warmup_r1))
         if epoch <= warmup_r1:
@@ -396,6 +435,9 @@ def train(policy, optimizer, cfg,
         # For --log-action: collect all actions for this batch
         batch_actions_r1 = []
         batch_actions_r2 = []
+
+        # --- Timing: batch episodes generation ---
+        batch_gen_start = time.time()
 
         for _ in range(batch_size):
             # per-user noise (keep or share, your call)
@@ -454,21 +496,23 @@ def train(policy, optimizer, cfg,
             batch_entropy_r2.append(torch.stack(entropy_r2))
 
             # For --log-action: store actions for this sample
-            if log_action:
-                # actions_r1 and actions_r2 are lists of (r, [slots]) for each user
-                # Store as list of dicts for each user
-                sample_actions_r1 = []
-                sample_actions_r2 = []
-                for u in range(num_users):
-                    r1, s1 = actions_r1[u]
-                    r2, s2 = actions_r2[u]
-                    sample_actions_r1.append(s1)
-                    sample_actions_r2.append(s2)
+            if log_action or True:
+                sample_actions_r1, sample_actions_r2 = store_sample_actions(actions_r1, actions_r2, num_users)
                 batch_actions_r1.append(sample_actions_r1)
                 batch_actions_r2.append(sample_actions_r2)
 
+        batch_gen_end = time.time()
+        batch_gen_duration = batch_gen_end - batch_gen_start
+
+        # --- Timing: training phase (REINFORCE update) ---
+        train_phase_start = time.time()
         # REINFORCE with baseline
         baseline = compute_reinforce_loss(batch_rewards, batch_log_probs, optimizer)
+        train_phase_end = time.time()
+        train_phase_duration = train_phase_end - train_phase_start
+
+        epoch_end_time = time.time()
+        epoch_duration = epoch_end_time - epoch_start_time
 
         # record epoch stats
         reward_history.append(baseline)
@@ -477,7 +521,12 @@ def train(policy, optimizer, cfg,
 
         # optional logging
         if log_file is not None:
-            log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_actions_r1, batch_actions_r2, log_action, log_file)
+            timing_info = {
+                "epoch_duration_sec": epoch_duration,
+                "batch_generation_sec": batch_gen_duration,
+                "train_phase_sec": train_phase_duration
+            }
+            log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_actions_r1, batch_actions_r2, log_action, log_file, timing_info=timing_info)
 
         if epoch % 100 == 0:
             print(f"Epoch {epoch}: "
@@ -485,11 +534,11 @@ def train(policy, optimizer, cfg,
                   f"Avg decoded (concat)={avg_unique_history[-1]:.2f}/{num_users}, "
                   f"frac(R1-decoded tx in R2)={frac_decR1_txR2_hist[-1]:.3f}, "
                   f"R1 act={last_r1_act:.3f} (λ1={lam_r1:.4f}), "
-                  f"R2 act={last_r2_act:.3f} (λ2={lam_r2:.4f})")
+                  f"R2 act={last_r2_act:.3f} (λ2={lam_r2:.4f}), "
+                  f"Epoch time={epoch_duration:.3f}s, Batch gen={batch_gen_duration:.3f}s, Train={train_phase_duration:.3f}s")
 
     return reward_history, avg_unique_history, frac_decR1_txR2_hist
 
-    return reward_history, avg_unique_history, frac_decR1_txR2_hist
 
 def main():
     args = parse_args()
