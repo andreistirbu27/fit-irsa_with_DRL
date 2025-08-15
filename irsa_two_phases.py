@@ -43,6 +43,7 @@ def parse_args():
     parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS, help='Keep only the last X saved models (default=2)')
     parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help='Random seed (default=1)')
     parser.add_argument('--gpu', action='store_true', help='Use GPU (cuda or mps) if available')
+    parser.add_argument('--epoch-half-lr-interval', type=int, default=None, help='If set, halve learning rate every N epochs')
     args = parser.parse_args()
     # --log-action implies --log
     if getattr(args, "log_action", False):
@@ -415,8 +416,20 @@ def train(policy, optimizer, cfg,
 
     log_action = cfg.get('log_action', False)
 
+    # Learning rate halving support
+    epoch_half_lr_interval = cfg.get('epoch_half_lr_interval', None)
+    if epoch_half_lr_interval is not None and epoch_half_lr_interval <= 0:
+        epoch_half_lr_interval = None  # ignore non-positive values
+
     for epoch in tqdm(range(epochs), desc="Training", unit="epoch"):
         epoch_start_time = time.time()
+
+        # Halve learning rate if needed
+        if epoch_half_lr_interval is not None and epoch > 0 and (epoch % epoch_half_lr_interval == 0):
+            for param_group in optimizer.param_groups:
+                old_lr = param_group['lr']
+                param_group['lr'] = old_lr / 2.0
+            tqdm.write(f"Learning rate halved at epoch {epoch}. New lr: {optimizer.param_groups[0]['lr']:.6f}")
 
         # ramped sparsity weights
         lam_r1 = sparsity_r1_max * min(1.0, epoch / float(warmup_r1))
@@ -594,7 +607,8 @@ def main():
         'keep_last_models': args.keep_last_models,
         'seed': args.seed,
         'prefix': args.prefix,
-        'log_action': getattr(args, "log_action", False)
+        'log_action': getattr(args, "log_action", False),
+        'epoch_half_lr_interval': getattr(args, "epoch_half_lr_interval", None)
     }
 
     # Derived dims
