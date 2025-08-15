@@ -281,6 +281,84 @@ def sic_decode(actions, total_slots):
                     progress = True
     return decoded_users
 
+def round1_actions(policy, obs_all, num_users, input_dim, feedback_dim, prev_action_dim, device):
+    actions_r1, acts_bin_r1, entropy_r1 = [], [], []
+    lp_r1_total = 0.0
+    for u in range(num_users):
+        x1 = torch.cat([
+            obs_all[u],
+            torch.zeros(feedback_dim, device=device),  # no feedback yet
+            torch.zeros(prev_action_dim, device=device)  # no previous action yet
+        ], dim=0)
+        assert x1.numel() == input_dim
+        logits_u = policy(x1)  # [num_slots]
+        cw_u, lp_u, a_u, e_u = sample_actions_user(logits_u)  # a_u: [num_slots] in {0,1}
+        actions_r1.append(cw_u)
+        acts_bin_r1.append(a_u)
+        entropy_r1.append(e_u)
+        lp_r1_total = lp_r1_total + lp_u
+    acts_bin_r1 = torch.stack(acts_bin_r1, dim=0)  # [num_users, num_slots]
+    return actions_r1, acts_bin_r1, entropy_r1, lp_r1_total
+
+def round2_actions(policy, obs_all, acts_bin_r1, fb_vec, num_users, input_dim, device):
+    actions_r2, acts_bin_r2, entropy_r2 = [], [], []
+    lp_r2_total = 0.0
+    for u in range(num_users):
+        prev_act_u = acts_bin_r1[u].float()  # THIS user's R1 action (0/1 per slot)
+        x2 = torch.cat([
+            obs_all[u],
+            fb_vec,
+            prev_act_u
+        ], dim=0)
+        assert x2.numel() == input_dim
+        logits_u = policy(x2)
+        cw_u, lp_u, a_u, e_u = sample_actions_user(logits_u)
+        actions_r2.append(cw_u)
+        acts_bin_r2.append(a_u)
+        entropy_r2.append(e_u)
+        lp_r2_total = lp_r2_total + lp_u
+    acts_bin_r2 = torch.stack(acts_bin_r2, dim=0)  # [num_users, num_slots]
+    return actions_r2, acts_bin_r2, entropy_r2, lp_r2_total
+
+def compute_reinforce_loss(batch_rewards, batch_log_probs, optimizer):
+    baseline = np.mean(batch_rewards)
+    total_loss = sum([-(r - baseline) * lp for r, lp in zip(batch_rewards, batch_log_probs)])
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+    return baseline
+
+def log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_actions_r1, batch_actions_r2, log_action, log_file):
+    all_entropy_r1 = torch.stack(batch_entropy_r1)
+    all_entropy_r2 = torch.stack(batch_entropy_r2)
+    rec = {
+        "epoch": epoch, 
+        "decoded_array": batch_uniques, 
+        "entropy_r1_mean": all_entropy_r1.mean().item(),
+        "entropy_r2_mean": all_entropy_r2.mean().item(),
+        "entropy_r1_std_dev": all_entropy_r1.std().item(),
+        "entropy_r2_std_dev": all_entropy_r2.std().item(),
+    }
+
+    nb_slots1 = np.array([len(slots) for frame in batch_actions_r1 for slots in frame])
+    nb_slots2 = np.array([len(slots) for frame in batch_actions_r2 for slots in frame])
+    total_slots = (nb_slots1 + nb_slots2)
+    unique, counts = np.unique(total_slots, return_counts=True)
+    histogram = dict(zip([int(u) for u in unique], [int(c) for c in counts]))
+    rec["total_slots_histogram"] = histogram
+
+    if log_action:
+        rec["actions_r1"] = batch_actions_r1
+        rec["actions_r2"] = batch_actions_r2
+
+    excluded_keys = ["decoded_array", "actions_r1", "actions_r2"]
+    info = {k: v for k, v in rec.items() if k not in excluded_keys}
+    info["decoded_mean"] = np.array(rec["decoded_array"]).mean()
+
+    status = str(info) # json.dumps(info)
+    tqdm.write(status)
+    print(json.dumps(rec), file=log_file, flush=True)
+
 # === Training (apply policy per user) ===
 def train(policy, optimizer, cfg,
           sparsity_r1_max=0.02, sparsity_r2_max=0.01,
@@ -324,45 +402,18 @@ def train(policy, optimizer, cfg,
             obs_all = [torch.rand(input_obs_dim, device=device) for _ in range(num_users)]
 
             # -------- Round 1: per-user policy (feedback=0, prev_action=zeros) --------
-            actions_r1, acts_bin_r1, entropy_r1 = [], [], []
-            lp_r1_total = 0.0
-            for u in range(num_users):
-                x1 = torch.cat([
-                    obs_all[u],
-                    torch.zeros(feedback_dim, device=device),  # no feedback yet
-                    torch.zeros(prev_action_dim, device=device)  # no previous action yet
-                ], dim=0)
-                assert x1.numel() == input_dim
-                logits_u = policy(x1)  # [num_slots]
-                cw_u, lp_u, a_u, e_u = sample_actions_user(logits_u)  # a_u: [num_slots] in {0,1}
-                actions_r1.append(cw_u)
-                acts_bin_r1.append(a_u)
-                entropy_r1.append(e_u)
-                lp_r1_total = lp_r1_total + lp_u
-            acts_bin_r1 = torch.stack(acts_bin_r1, dim=0)  # [num_users, num_slots]
+            actions_r1, acts_bin_r1, entropy_r1, lp_r1_total = round1_actions(
+                policy, obs_all, num_users, input_dim, feedback_dim, prev_action_dim, device
+            )
 
             # feedback from Round 1
             decoded_r1, fb_idx = run_sic_simulation(actions_r1, num_slots, return_feedback_indices=True)
 
             # -------- Round 2: per-user policy (feedback + prev_action from R1) --------
             fb_vec = feedback_indices_to_vector(fb_idx, num_slots).to(device)  # len = 3*num_slots
-            actions_r2, acts_bin_r2, entropy_r2 = [], [], []
-            lp_r2_total = 0.0
-            for u in range(num_users):
-                prev_act_u = acts_bin_r1[u].float()  # THIS user's R1 action (0/1 per slot)
-                x2 = torch.cat([
-                    obs_all[u],
-                    fb_vec,
-                    prev_act_u
-                ], dim=0)
-                assert x2.numel() == input_dim
-                logits_u = policy(x2)
-                cw_u, lp_u, a_u, e_u = sample_actions_user(logits_u)
-                actions_r2.append(cw_u)
-                acts_bin_r2.append(a_u)
-                entropy_r2.append(e_u)
-                lp_r2_total = lp_r2_total + lp_u
-            acts_bin_r2 = torch.stack(acts_bin_r2, dim=0)  # [num_users, num_slots]
+            actions_r2, acts_bin_r2, entropy_r2, lp_r2_total = round2_actions(
+                policy, obs_all, acts_bin_r1, fb_vec, num_users, input_dim, device
+            )
 
             # -------- CONCATENATE schedules and decode ONCE --------
             # Map Round-2 slots to [num_slots .. 2*num_slots-1], keep R1 as [0 .. num_slots-1]
@@ -411,19 +462,13 @@ def train(policy, optimizer, cfg,
                 for u in range(num_users):
                     r1, s1 = actions_r1[u]
                     r2, s2 = actions_r2[u]
-                    #sample_actions_r1.append({"user": u, "r": r1, "slots": s1})
-                    #sample_actions_r2.append({"user": u, "r": r2, "slots": s2})
                     sample_actions_r1.append(s1)
                     sample_actions_r2.append(s2)
                 batch_actions_r1.append(sample_actions_r1)
                 batch_actions_r2.append(sample_actions_r2)
 
         # REINFORCE with baseline
-        baseline = np.mean(batch_rewards)
-        total_loss = sum([-(r - baseline) * lp for r, lp in zip(batch_rewards, batch_log_probs)])
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
+        baseline = compute_reinforce_loss(batch_rewards, batch_log_probs, optimizer)
 
         # record epoch stats
         reward_history.append(baseline)
@@ -432,43 +477,7 @@ def train(policy, optimizer, cfg,
 
         # optional logging
         if log_file is not None:
-            all_entropy_r1 = torch.stack(batch_entropy_r1)
-            all_entropy_r2 = torch.stack(batch_entropy_r2)
-            rec = {
-                "epoch": epoch, 
-                "decoded_array": batch_uniques, 
-                "entropy_r1_mean": all_entropy_r1.mean().item(),
-                "entropy_r2_mean": all_entropy_r2.mean().item(),
-                "entropy_r1_std_dev": all_entropy_r1.std().item(),
-                "entropy_r2_std_dev": all_entropy_r2.std().item(),
-            }
-
-            # rec["actions_r1"] and rec["actions_r2"] are lists of lists of slot indices
-            # Outer list: batch, inner list: users, value: list of slots for that user
-            nb_slots1 = np.array([len(slots) for frame in batch_actions_r1 for slots in frame])
-            nb_slots2 = np.array([len(slots) for frame in batch_actions_r2 for slots in frame])
-            
-            #info["nb_slots"] = list(sorted([int(x) for x in np.concatenate([nb_slots1, nb_slots2])]))
-            total_slots = (nb_slots1+nb_slots2)
-            # Compute histogram of total_slots (dict: value: counts)
-            # total_slots is a numpy array of total slots per user per batch
-            unique, counts = np.unique(total_slots, return_counts=True)
-            histogram = dict(zip([int(u) for u in unique], [int(c) for c in counts]))
-            rec["total_slots_histogram"] = histogram
-
-
-            # If --log-action, add actions to the log record
-            if log_action:
-                rec["actions_r1"] = batch_actions_r1
-                rec["actions_r2"] = batch_actions_r2
-
-            excluded_keys = ["decoded_array", "actions_r1", "actions_r2"]
-            info = {k: v for k, v in rec.items() if k not in excluded_keys}
-            info["decoded_mean"] = np.array(rec["decoded_array"]).mean()
-
-            status = str(info) # json.dumps(info)
-            tqdm.write(status)
-            print(json.dumps(rec), file=log_file, flush=True)
+            log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_actions_r1, batch_actions_r2, log_action, log_file)
 
         if epoch % 100 == 0:
             print(f"Epoch {epoch}: "
@@ -477,6 +486,8 @@ def train(policy, optimizer, cfg,
                   f"frac(R1-decoded tx in R2)={frac_decR1_txR2_hist[-1]:.3f}, "
                   f"R1 act={last_r1_act:.3f} (λ1={lam_r1:.4f}), "
                   f"R2 act={last_r2_act:.3f} (λ2={lam_r2:.4f})")
+
+    return reward_history, avg_unique_history, frac_decR1_txR2_hist
 
     return reward_history, avg_unique_history, frac_decR1_txR2_hist
 
