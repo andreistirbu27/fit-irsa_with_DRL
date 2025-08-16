@@ -448,7 +448,16 @@ def train(
     best_val = float("inf")
     best_state = None
     model_save_dir = run_dir
-    train_log_path = os.path.join(run_dir, "training-generator.jsonl")
+
+    # --- Training log file logic ---
+    # If resuming, create a new log file with a unique name (timestamped)
+    if getattr(args, "resume", False):
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        train_log_path = os.path.join(run_dir, f"training-generator-resume-{timestamp}.jsonl")
+    else:
+        train_log_path = os.path.join(run_dir, "training-generator.jsonl")
+    # -----------------------------
 
     # -----------------------------
     # Training loop
