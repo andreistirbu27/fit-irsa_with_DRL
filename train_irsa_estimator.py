@@ -344,7 +344,7 @@ def manage_saved_models(model_dir, keep_last):
 # -----------------------------
 # Training/validation loop
 # -----------------------------
-def run_epoch(model, loader, criterion, optimizer, device, train, grad_clip, batch_limit):
+def run_epoch(model, loader, criterion, optimizer, device, train, grad_clip, batch_limit, scheduler=None, step_per_batch=False):
     if train:
         model.train()
     else:
@@ -365,6 +365,8 @@ def run_epoch(model, loader, criterion, optimizer, device, train, grad_clip, bat
                 if grad_clip is not None:
                     nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
+                if step_per_batch and scheduler is not None:
+                    scheduler.step()
 
             total_loss += loss.item() * xb.size(0)
             n += xb.size(0)
@@ -396,6 +398,9 @@ def train(
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, drop_last=False)
 
+    steps_per_epoch = len(train_loader)
+    steps_per_epoch_effective = min(steps_per_epoch, args.batches_per_epoch)
+
     # -----------------------------
     # Instantiate model, loss, optim
     # -----------------------------
@@ -420,9 +425,25 @@ def train(
         else:
             print(f"[resume] model-best.pt not found in {run_dir}, starting from scratch.")
 
+
     criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    if not args.warmup_cosine:
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
+    else:
+        total_steps = args.epochs * steps_per_epoch_effective
+        warmup_steps = max(3 * steps_per_epoch_effective, int(0.03 * total_steps))
+        eta_min = 1e-6
+        base_lr = args.lr
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return (step + 1) / warmup_steps
+            t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return eta_min / base_lr + 0.5 * (1 - eta_min / base_lr) * (1 + math.cos(math.pi * t))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     best_val = float("inf")
     best_state = None
@@ -437,13 +458,18 @@ def train(
             epoch_start = time.time()
             train_loss = run_epoch(
                 model, train_loader, criterion, optimizer, args.device, train=True,
-                grad_clip=args.grad_clip, batch_limit=args.batches_per_epoch
+                grad_clip=args.grad_clip, batch_limit=args.batches_per_epoch,
+                scheduler=scheduler if args.warmup_cosine else None,
+                step_per_batch=args.warmup_cosine
             )
+
             val_loss = run_epoch(
                 model, val_loader, criterion, optimizer, args.device, train=False,
                 grad_clip=args.grad_clip, batch_limit=args.batches_per_epoch
             )
-            scheduler.step()
+
+            if not args.warmup_cosine:
+                scheduler.step()
             epoch_end = time.time()
             duration = epoch_end - epoch_start
 
@@ -451,18 +477,19 @@ def train(
                 best_val = val_loss
                 best_state = {k: v.cpu() for k, v in model.state_dict().items()}
 
+            current_lr = optimizer.param_groups[0]['lr']
             log_entry = {
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
-                "lr": scheduler.get_last_lr()[0],
+                "lr": current_lr,
                 "duration_sec": duration,
                 "best_val_loss": best_val
             }
             train_log_f.write(json.dumps(log_entry) + "\n")
             train_log_f.flush()
 
-            print(f"[{epoch:03d}/{args.epochs}] train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  lr={scheduler.get_last_lr()[0]:.2e}  duration={duration:.2f}s")
+            print(f"[{epoch:03d}/{args.epochs}] train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  lr={current_lr:.2e}  duration={duration:.2f}s")
 
             # Save model at intervals
             if args.epoch_save_interval > 0 and (epoch % args.epoch_save_interval == 0 or epoch == args.epochs):
@@ -495,6 +522,8 @@ def parse_args():
     parser.add_argument('--batches-per-epoch', type=int, default=1000, help='Limit to this many batches per epoch')
     parser.add_argument('--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--resume', action='store_true', help='Resume training from model-best.pt if it exists')
+    parser.add_argument('--warmup-cosine', action='store_true', help='Per-batch linear warmup (~3% or 3 epochs) then cosine decay to eta_min=1e-6.')
+    parser.add_argument('--lr', type=float, default=3e-4, help='Base learning rate')
     return parser.parse_args()
 
 def main():
