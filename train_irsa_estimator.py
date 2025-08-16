@@ -1,10 +1,17 @@
-#%%
 import os
 import json
 import gzip
+import time
+import argparse
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 import irsa_two_phases
+import math
+import torch.nn as nn
+import torch.optim as optim
+
+DEFAULT_KEEP_LAST_MODELS = 2
+DEFAULT_SEED = 42
 
 # ---------------------------
 # Utilities: load logs/config
@@ -40,8 +47,6 @@ def load_config(run_dir: str) -> dict:
         raise FileNotFoundError(f"No config.json found in {run_dir}")
     with open(cfg_path, "r") as f:
         return json.load(f)
-
-
 
 def build_actions_feedback_dataset(
     data,
@@ -128,25 +133,6 @@ def build_actions_feedback_dataset(
 
     return one_hot_actions, feedback_vectors, U0, S0, num_samples, num_records_with_actions
 
-# ----------
-# Parameters
-# ----------
-RUN_DIR = "res-1p-u10-sl10-e1000-b1000-s100"  # adjust as needed
-RUN_DIR = "res-1p-u10-s10-e1000-b1000-s100"
-DATASET_OUT = os.path.join(RUN_DIR, "actions_feedback_dataset.pt")
-USE_ENERGY_FEEDBACK = False   # if True, use per-slot counts instead of undecoded one-hot
-VERBOSE = True
-
-# -----------------
-# Load config (always), but only load log if building dataset
-config = load_config(RUN_DIR)
-num_slots_cfg = int(config["num_slots"])
-num_users_cfg = int(config["num_users"])
-
-# -----------------------------------------------------------
-# 1) Build dataset: actions (one-hot) -> feedback vectors
-#    Only build and save if DATASET_OUT does not exist
-# -----------------------------------------------------------
 def load_or_build_actions_feedback_dataset(
     run_dir,
     dataset_out,
@@ -197,16 +183,6 @@ def load_or_build_actions_feedback_dataset(
             print(f"one_hot_actions: {tuple(one_hot_actions.shape)}  feedback_vectors: {tuple(feedback_vectors.shape)}")
     return one_hot_actions, feedback_vectors, U, S, num_samples, num_records_with_actions
 
-# Use the function to load or build the dataset
-one_hot_actions, feedback_vectors, U, S, num_samples, num_records_with_actions = load_or_build_actions_feedback_dataset(
-    RUN_DIR,
-    DATASET_OUT,
-    num_slots_cfg,
-    num_users_cfg,
-    use_energy_feedback=USE_ENERGY_FEEDBACK,
-    verbose=VERBOSE
-)
-
 # -------------------------------------------------------------------
 # 3) Define PyTorch Dataset and DataLoader (no model defined here)
 # -------------------------------------------------------------------
@@ -226,29 +202,6 @@ class ActionsFeedbackDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.one_hot_actions[idx], self.feedback_vectors[idx]
-
-# Example construction (kept minimal; adjust batch_size as needed)
-dataset = ActionsFeedbackDataset(one_hot_actions, feedback_vectors)
-dataloader = DataLoader(dataset, batch_size=64, shuffle=True, drop_last=False)
-
-if VERBOSE:
-    first_batch = next(iter(dataloader))
-    xb, yb = first_batch
-    print(f"[dataloader] batch x: {tuple(xb.shape)}, y: {tuple(yb.shape)}")
-
-#%%
-
-# --- 4) Transformer model (encoder-only) and training loop: one-hot actions -> feedback ---
-
-import math
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import random_split, DataLoader
-
-# Derive shapes from the dataset you built above
-N, U, S = one_hot_actions.shape   # [N, num_users, num_slots]
-F = feedback_vectors.shape[1]     # feedback_dim (typically 3*S)
 
 # -----------------------------
 # Model: Action -> Feedback (2D learned embeddings for (user, slot))
@@ -342,55 +295,56 @@ class ActionToFeedbackTransformer(nn.Module):
         out = self.head(h)                                                 # [B, F]
         return out
 
+# -----------------------------
+# Device and seed utilities
+# -----------------------------
+def get_device():
+    if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
+        return torch.device('mps')
+    elif torch.cuda.is_available():
+        return torch.device('cuda')
+    else:
+        return torch.device('cpu')
+
+def set_seed(seed):
+    import random
+    import numpy as np
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 # -----------------------------
-# Train/val split + DataLoaders
+# Model saving and management
 # -----------------------------
-if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
-    device = torch.device('mps')
-elif torch.cuda.is_available():
-    device = torch.device('cuda')
-else:
-    device = torch.device('cpu')
-print(f"Using device: {device}")
+def save_model(model, path):
+    torch.save(model.state_dict(), path)
 
-
-val_frac = 0.1
-val_size = max(1, int(len(dataset) * val_frac))
-train_size = len(dataset) - val_size
-train_ds, val_ds = random_split(dataset, [train_size, val_size])
-
-batch_size = 128
-train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
-val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False)
-
-# -----------------------------
-# Instantiate model, loss, optim
-# -----------------------------
-model = ActionToFeedbackTransformer(
-    num_users=U,
-    num_slots=S,
-    feedback_dim=F,
-    d_model=128,
-    nhead=8,
-    num_layers=4,
-    dim_feedforward=256,
-    dropout=0.1,
-).to(device)
-
-# Use MSE since feedback can be binary (0/1) or counts if energy feedback was used
-criterion = nn.MSELoss()
-optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
+def manage_saved_models(model_dir, keep_last):
+    """
+    Remove all but the last N models (sorted by epoch in filename)
+    """
+    model_files = [f for f in os.listdir(model_dir) if f.startswith("model-epoch") and f.endswith(".pt")]
+    if len(model_files) <= keep_last:
+        return
+    # Extract epoch number
+    def get_epoch(f):
+        try:
+            return int(f.split("model-epoch")[1].split(".pt")[0])
+        except Exception:
+            return -1
+    model_files = sorted(model_files, key=get_epoch)
+    for f in model_files[:-keep_last]:
+        try:
+            os.remove(os.path.join(model_dir, f))
+        except Exception as e:
+            print(f"Warning: could not remove {f}: {e}")
 
 # -----------------------------
-# Training loop
+# Training/validation loop
 # -----------------------------
-epochs = 50
-grad_clip = 1.0
-BATCH_LIMIT = 10  # Limit to this many batches per epoch
-
-def run_epoch(loader, train: bool):
+def run_epoch(model, loader, criterion, optimizer, device, train, grad_clip, batch_limit):
     if train:
         model.train()
     else:
@@ -400,9 +354,9 @@ def run_epoch(loader, train: bool):
     batch_count = 0
     with torch.set_grad_enabled(train):
         for xb, yb in loader:
-            xb = xb.to(device)            # [B,U,S]
-            yb = yb.to(device)            # [B,F]
-            pred = model(xb)              # [B,F]
+            xb = xb.to(device)
+            yb = yb.to(device)
+            pred = model(xb)
             loss = criterion(pred, yb)
 
             if train:
@@ -415,27 +369,177 @@ def run_epoch(loader, train: bool):
             total_loss += loss.item() * xb.size(0)
             n += xb.size(0)
             batch_count += 1
-            if batch_count >= BATCH_LIMIT:
+            if batch_count >= batch_limit:
                 break
     return total_loss / max(1, n)
 
-best_val = float("inf")
-best_state = None
+def train(
+    args,
+    one_hot_actions,
+    feedback_vectors,
+    U,
+    S,
+    F,
+    run_dir,
+    dataset,
+):
+    """
+    Main training loop, model setup, logging, and saving.
+    """
+    # -----------------------------
+    # Train/val split + DataLoaders
+    # -----------------------------
+    val_size = max(1, int(len(dataset) * args.val_frac))
+    train_size = len(dataset) - val_size
+    train_ds, val_ds = random_split(dataset, [train_size, val_size])
 
-for epoch in range(1, epochs + 1):
-    train_loss = run_epoch(train_loader, train=True)
-    val_loss = run_epoch(val_loader, train=False)
-    scheduler.step()
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, drop_last=False)
 
-    if val_loss < best_val:
-        best_val = val_loss
-        best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+    # -----------------------------
+    # Instantiate model, loss, optim
+    # -----------------------------
+    model = ActionToFeedbackTransformer(
+        num_users=U,
+        num_slots=S,
+        feedback_dim=F,
+        d_model=128,
+        nhead=8,
+        num_layers=4,
+        dim_feedforward=256,
+        dropout=0.1,
+    ).to(args.device)
 
-    if epoch % 5 == 0 or epoch == 1:
-        print(f"[{epoch:03d}/{epochs}] train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  lr={scheduler.get_last_lr()[0]:.2e}")
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
 
-# (Optional) restore best weights
-if best_state is not None:
-    model.load_state_dict(best_state)
-    model.to(device)
-    print(f"Restored best model with val_loss={best_val:.6f}")
+    best_val = float("inf")
+    best_state = None
+    model_save_dir = run_dir
+    train_log_path = os.path.join(run_dir, "training-generator.jsonl")
+
+    # -----------------------------
+    # Training loop
+    # -----------------------------
+    with open(train_log_path, "w") as train_log_f:
+        for epoch in range(1, args.epochs + 1):
+            epoch_start = time.time()
+            train_loss = run_epoch(
+                model, train_loader, criterion, optimizer, args.device, train=True,
+                grad_clip=args.grad_clip, batch_limit=args.batches_per_epoch
+            )
+            val_loss = run_epoch(
+                model, val_loader, criterion, optimizer, args.device, train=False,
+                grad_clip=args.grad_clip, batch_limit=args.batches_per_epoch
+            )
+            scheduler.step()
+            epoch_end = time.time()
+            duration = epoch_end - epoch_start
+
+            if val_loss < best_val:
+                best_val = val_loss
+                best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+
+            log_entry = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "lr": scheduler.get_last_lr()[0],
+                "duration_sec": duration,
+                "best_val_loss": best_val
+            }
+            train_log_f.write(json.dumps(log_entry) + "\n")
+            train_log_f.flush()
+
+            print(f"[{epoch:03d}/{args.epochs}] train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  lr={scheduler.get_last_lr()[0]:.2e}  duration={duration:.2f}s")
+
+            # Save model at intervals
+            if args.epoch_save_interval > 0 and (epoch % args.epoch_save_interval == 0 or epoch == args.epochs):
+                model_path = os.path.join(model_save_dir, f"model-epoch{epoch}.pt")
+                save_model(model, model_path)
+                print(f"Saved model at {model_path}")
+                manage_saved_models(model_save_dir, args.keep_last_models)
+
+    # Restore best weights and save final model
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        model.to(args.device)
+        print(f"Restored best model with val_loss={best_val:.6f}")
+        best_model_path = os.path.join(model_save_dir, "model-best.pt")
+        save_model(model, best_model_path)
+        print(f"Saved best model at {best_model_path}")
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--epoch-save-interval', type=int, default=200, help='Save model every N epochs')
+    parser.add_argument('--result-dir', type=str, default=None, help='Override result dir')
+    parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS, help='Keep only the last X saved models (default=2)')
+    parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help=f'Random seed (default={DEFAULT_SEED})')
+    parser.add_argument('--run-dir', type=str, default="res-1p-u10-s10-e1000-b1000-s100", help='Result directory (default: res-1p-u10-s10-e1000-b1000-s100)')
+    parser.add_argument('--use-energy-feedback', action='store_true', help='Use per-slot counts instead of undecoded one-hot')
+    parser.add_argument('--epochs', type=int, default=500, help='Number of epochs')
+    parser.add_argument('--batch-size', type=int, default=128, help='Batch size')
+    parser.add_argument('--val-frac', type=float, default=0.1, help='Validation fraction')
+    parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping value')
+    parser.add_argument('--batches-per-epoch', type=int, default=1000, help='Limit to this many batches per epoch')
+    parser.add_argument('--verbose', action='store_true', help='Verbose output')
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+
+    # Determine run directory
+    run_dir = args.result_dir if args.result_dir is not None else args.run_dir
+    os.makedirs(run_dir, exist_ok=True)
+    DATASET_OUT = os.path.join(run_dir, "actions_feedback_dataset.pt")
+
+    # -----------------
+    # Load config (always), but only load log if building dataset
+    config = load_config(run_dir)
+    num_slots_cfg = int(config["num_slots"])
+    num_users_cfg = int(config["num_users"])
+
+    # -----------------------------------------------------------
+    # 1) Build dataset: actions (one-hot) -> feedback vectors
+    #    Only build and save if DATASET_OUT does not exist
+    # -----------------------------------------------------------
+    one_hot_actions, feedback_vectors, U, S, num_samples, num_records_with_actions = load_or_build_actions_feedback_dataset(
+        run_dir,
+        DATASET_OUT,
+        num_slots_cfg,
+        num_users_cfg,
+        use_energy_feedback=args.use_energy_feedback,
+        verbose=args.verbose
+    )
+
+    # -------------------------------------------------------------------
+    # 3) Define PyTorch Dataset and DataLoader (no model defined here)
+    # -------------------------------------------------------------------
+    dataset = ActionsFeedbackDataset(one_hot_actions, feedback_vectors)
+    if args.verbose:
+        dataloader = DataLoader(dataset, batch_size=64, shuffle=True, drop_last=False)
+        first_batch = next(iter(dataloader))
+        xb, yb = first_batch
+        print(f"[dataloader] batch x: {tuple(xb.shape)}, y: {tuple(yb.shape)}")
+
+    N, U, S = one_hot_actions.shape   # [N, num_users, num_slots]
+    F = feedback_vectors.shape[1]     # feedback_dim (typically 3*S)
+
+    args.device = get_device()
+    print(f"Using device: {args.device}")
+
+    train(
+        args=args,
+        one_hot_actions=one_hot_actions,
+        feedback_vectors=feedback_vectors,
+        U=U,
+        S=S,
+        F=F,
+        run_dir=run_dir,
+        dataset=dataset,
+    )
+
+if __name__ == "__main__":
+    main()
