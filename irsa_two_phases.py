@@ -45,6 +45,8 @@ def parse_args():
     parser.add_argument('--gpu', action='store_true', help='Use GPU (cuda or mps) if available')
     parser.add_argument('--epoch-half-lr-interval', type=int, default=None, help='If set, halve learning rate every N epochs')
     parser.add_argument('--one-phase', action='store_true', help='Run only Round 1 (Round 2 disabled; equivalent to 0 slots in phase 2)')
+    parser.add_argument('--energy-feedback', action='store_true', help='Use scalar energy feedback (fraction of undecoded users after R1) instead of 3*S indices')
+
     args = parser.parse_args()
     # --log-action implies --log
     if getattr(args, "log_action", False):
@@ -57,6 +59,8 @@ def make_result_dir(cfg):
         base += "-"+cfg["prefix"]
     if cfg.get('one_phase', False):
         base += "-1p"
+    if cfg.get('energy_feedback', False):
+        base += "-ef"   # mark runs that use energy feedback
 
     if cfg['result_dir'] is not None:
         result_dir = cfg['result_dir']
@@ -249,11 +253,12 @@ def run_sic_simulation(actions, num_slots, return_feedback_indices=False):
         empty_idx = sorted(list(initial_empty))  # empty from start
         undec_idx = sorted([i for i in range(num_slots)
                             if len(slots_init[i]) > 0 and len(slots[i]) > 0])  # still occupied
-        return decoded_users, [decoded_idx, empty_idx, undec_idx]
+        energy_per_slot = [len(slots[s]) for s in range(num_slots)]
+        return decoded_users, [decoded_idx, empty_idx, undec_idx], energy_per_slot
 
     return decoded_users
 
-def feedback_indices_to_vector(feedback_indices, num_slots):
+def feedback_indices_to_vector(feedback_indices, num_slots, energy_per_slot=None, use_energy=False):
     decoded_idx, empty_idx, undec_idx = feedback_indices
     d = torch.zeros(num_slots)
     e = torch.zeros(num_slots)
@@ -261,6 +266,11 @@ def feedback_indices_to_vector(feedback_indices, num_slots):
     if decoded_idx: d[decoded_idx] = 1
     if empty_idx:   e[empty_idx] = 1
     if undec_idx:   u[undec_idx] = 1
+
+    if use_energy and energy_per_slot is not None:
+        # per-slot energy (counts), length == num_slots
+        u = torch.tensor(energy_per_slot, dtype=d.dtype)
+
     return torch.cat([d, e, u], dim=0)  # length = 3*num_slots
 
 # --- small local SIC for arbitrary slot count (no feedback needed here) ---
@@ -467,11 +477,13 @@ def train(policy, optimizer, cfg,
             )
 
             # feedback from Round 1
-            decoded_r1, fb_idx = run_sic_simulation(actions_r1, num_slots, return_feedback_indices=True)
+            decoded_r1, fb_idx, energy_per_slot = run_sic_simulation(actions_r1, num_slots, return_feedback_indices=True)
 
             # -------- Round 2 (optional): per-user policy --------
             if not one_phase:
-                fb_vec = feedback_indices_to_vector(fb_idx, num_slots).to(device)  # len = 3*num_slots
+                fb_vec = feedback_indices_to_vector(fb_idx, num_slots,
+                    energy_per_slot=energy_per_slot,
+                    use_energy=cfg.get('energy_feedback', False)).to(device)  # len = 3*num_slots
                 actions_r2, acts_bin_r2, entropy_r2, lp_r2_total = round2_actions(
                     policy, obs_all, acts_bin_r1, fb_vec, num_users, input_dim, device
                 )
@@ -628,7 +640,8 @@ def main():
         'prefix': args.prefix,
         'log_action': getattr(args, "log_action", False),
         'epoch_half_lr_interval': getattr(args, "epoch_half_lr_interval", None),
-        'one_phase': getattr(args, 'one_phase', False)
+        'one_phase': getattr(args, 'one_phase', False),
+        'energy_feedback': getattr(args, 'energy_feedback', False),
     }
 
     # Derived dims
