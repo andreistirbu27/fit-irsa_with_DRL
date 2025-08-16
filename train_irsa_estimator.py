@@ -3,12 +3,16 @@ import json
 import gzip
 import time
 import argparse
+import math
+import datetime
+
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
-import irsa_two_phases
-import math
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.swa_utils import AveragedModel, update_bn
+
+import irsa_two_phases
 
 DEFAULT_KEEP_LAST_MODELS = 2
 DEFAULT_SEED = 42
@@ -18,19 +22,12 @@ DEFAULT_SEED = 42
 # ---------------------------
 
 def find_jsonl_file(run_dir: str) -> str:
-    """
-    Return the path to a .jsonl or .jsonl.gz file in run_dir.
-    Raises FileNotFoundError if none is found.
-    """
     for fname in os.listdir(run_dir):
         if fname.endswith('.jsonl') or fname.endswith('.jsonl.gz'):
             return os.path.join(run_dir, fname)
     raise FileNotFoundError(f"No .jsonl or .jsonl.gz file found in {run_dir}")
 
 def load_jsonl(path: str):
-    """
-    Load a jsonl or jsonl.gz file and return a list of dicts.
-    """
     if path.endswith('.gz'):
         with gzip.open(path, 'rt') as f:
             return [json.loads(line) for line in f if line.strip()]
@@ -39,9 +36,6 @@ def load_jsonl(path: str):
             return [json.loads(line) for line in f if line.strip()]
 
 def load_config(run_dir: str) -> dict:
-    """
-    Load config.json from run_dir.
-    """
     cfg_path = os.path.join(run_dir, "config.json")
     if not os.path.exists(cfg_path):
         raise FileNotFoundError(f"No config.json found in {run_dir}")
@@ -55,47 +49,35 @@ def build_actions_feedback_dataset(
     use_energy_feedback=False,
     verbose=False
 ):
-    """
-    Build the dataset of (one_hot_actions, feedback_vectors) from log data.
-    Returns (one_hot_actions, feedback_vectors, U, S, num_samples, num_records_with_actions)
-    """
-    all_one_hot_actions = []   # list of [U, S] float32 tensors
-    all_feedback_vectors = []  # list of [3S] (or alternative) float32 tensors
+    all_one_hot_actions = []
+    all_feedback_vectors = []
     num_samples = 0
     num_records_with_actions = 0
 
     for rec_idx, rec in enumerate(data):
         if "actions_r1" not in rec:
-            # This record doesn't include action logs (requires --log-action at train time).
             continue
-        actions_r1 = rec["actions_r1"]  # List[simulation][user] -> List[int slots]
+        actions_r1 = rec["actions_r1"]
         if not actions_r1:
             continue
 
         num_records_with_actions += 1
 
-        # Sanity: infer users from first simulation and compare to config
         sim0 = actions_r1[0]
         U = len(sim0)
         S = num_slots_cfg
         if U != num_users_cfg and verbose:
             print(f"[warn] record {rec_idx}: users in log={U} != config={num_users_cfg} (continuing with U={U})")
 
-        # Iterate simulations in this record
         for sim_idx, actions_list in enumerate(actions_r1):
-            # actions_list is List[List[int]] with length U
-            # Build one-hot [U, S]
             one_hot = torch.zeros(U, S, dtype=torch.float32)
-            # Build SIC input structure: List[(r, slot_list)] per user
             sic_actions = []
             for u, slots in enumerate(actions_list):
-                # keep only valid, unique slots
                 clean_slots = sorted({s for s in slots if 0 <= s < S})
                 if clean_slots:
                     one_hot[u, torch.tensor(clean_slots, dtype=torch.long)] = 1.0
                 sic_actions.append((len(clean_slots), clean_slots))
 
-            # Run SIC and construct feedback vector
             decoded_users, feedback_indices, energy_per_slot = irsa_two_phases.run_sic_simulation(
                 sic_actions, S, return_feedback_indices=True
             )
@@ -119,7 +101,6 @@ def build_actions_feedback_dataset(
         print(f"Records with actions: {num_records_with_actions}/{len(data)}")
         print(f"Total samples: {num_samples}")
 
-    # Shape consistency checks before stacking
     U0, S0 = all_one_hot_actions[0].shape
     F0 = all_feedback_vectors[0].numel()
     for i, (a, f) in enumerate(zip(all_one_hot_actions, all_feedback_vectors)):
@@ -141,10 +122,6 @@ def load_or_build_actions_feedback_dataset(
     use_energy_feedback=False,
     verbose=True
 ):
-    """
-    Loads the actions-feedback dataset from disk if it exists, otherwise builds it from log data.
-    Returns: one_hot_actions, feedback_vectors, U, S, num_samples, num_records_with_actions
-    """
     if os.path.exists(dataset_out):
         if verbose:
             print(f"Loading existing dataset: {dataset_out}")
@@ -154,7 +131,7 @@ def load_or_build_actions_feedback_dataset(
         U = one_hot_actions.shape[1]
         S = one_hot_actions.shape[2]
         num_samples = one_hot_actions.shape[0]
-        num_records_with_actions = None  # Not tracked when loading
+        num_records_with_actions = None
         if verbose:
             print(f"Loaded dataset: {dataset_out}")
             print(f"one_hot_actions: {tuple(one_hot_actions.shape)}  feedback_vectors: {tuple(feedback_vectors.shape)}")
@@ -184,14 +161,10 @@ def load_or_build_actions_feedback_dataset(
     return one_hot_actions, feedback_vectors, U, S, num_samples, num_records_with_actions
 
 # -------------------------------------------------------------------
-# 3) Define PyTorch Dataset and DataLoader (no model defined here)
+# Dataset
 # -------------------------------------------------------------------
 class ActionsFeedbackDataset(Dataset):
     def __init__(self, one_hot_actions: torch.Tensor, feedback_vectors: torch.Tensor):
-        """
-        one_hot_actions: [N, U, S] float tensor
-        feedback_vectors: [N, F] float tensor (F = 3*S if using default feedback)
-        """
         if one_hot_actions.shape[0] != feedback_vectors.shape[0]:
             raise ValueError("Mismatched N between actions and feedback.")
         self.one_hot_actions = one_hot_actions
@@ -204,7 +177,7 @@ class ActionsFeedbackDataset(Dataset):
         return self.one_hot_actions[idx], self.feedback_vectors[idx]
 
 # -----------------------------
-# Model: Action -> Feedback (2D learned embeddings for (user, slot))
+# Model: Action -> Feedback
 # -----------------------------
 class ActionToFeedbackTransformer(nn.Module):
     def __init__(
@@ -226,14 +199,11 @@ class ActionToFeedbackTransformer(nn.Module):
         self.feedback_dim = feedback_dim
         self.d_model = d_model
 
-        # Learned 2D embeddings: user and slot
         self.user_embed = nn.Embedding(num_users, d_model // 2)
         self.slot_embed = nn.Embedding(num_slots, d_model // 2)
 
-        # Project scalar one-hot (0/1) into d_model channels
         self.input_proj = nn.Linear(1, d_model)
 
-        # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -244,17 +214,15 @@ class ActionToFeedbackTransformer(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Output head: flatten [U*S, d_model] and map to feedback vector
         self.head = nn.Sequential(
-            nn.Flatten(start_dim=1),                                # [B, U*S*d_model]
+            nn.Flatten(start_dim=1),
             nn.Linear(num_users * num_slots * d_model, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, feedback_dim)
         )
 
-        # Register static (user,slot) index grids as buffers so they move with the model's device
-        user_idx = torch.arange(num_users).view(1, num_users, 1).expand(1, num_users, num_slots)  # [1,U,S]
-        slot_idx = torch.arange(num_slots).view(1, 1, num_slots).expand(1, num_users, num_slots)  # [1,U,S]
+        user_idx = torch.arange(num_users).view(1, num_users, 1).expand(1, num_users, num_slots)
+        slot_idx = torch.arange(num_slots).view(1, 1, num_slots).expand(1, num_users, num_slots)
         self.register_buffer("user_idx_grid", user_idx, persistent=False)
         self.register_buffer("slot_idx_grid", slot_idx, persistent=False)
 
@@ -269,29 +237,18 @@ class ActionToFeedbackTransformer(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, U, S] one-hot (0/1) tensor.
-        Returns: [B, F] predicted feedback vector.
-        """
         B, U, S = x.shape
         assert U == self.num_users and S == self.num_slots, "Input shape does not match model's (U,S)."
 
-        # Embeddings for (user, slot) positions
-        user_emb = self.user_embed(self.user_idx_grid.expand(B, -1, -1))  # [B,U,S,d/2]
-        slot_emb = self.slot_embed(self.slot_idx_grid.expand(B, -1, -1))  # [B,U,S,d/2]
+        user_emb = self.user_embed(self.user_idx_grid.expand(B, -1, -1))
+        slot_emb = self.slot_embed(self.slot_idx_grid.expand(B, -1, -1))
         pos_emb = torch.cat([user_emb, slot_emb], dim=-1)                  # [B,U,S,d]
 
-        # Project scalar inputs to d_model and add positional embeddings
         x_proj = self.input_proj(x.unsqueeze(-1))                          # [B,U,S,d]
         x_enc = x_proj + pos_emb
 
-        # Flatten grid to sequence for the encoder: [B, U*S, d]
         x_seq = x_enc.view(B, U * S, self.d_model)
-
-        # Encoder
         h = self.encoder(x_seq)                                            # [B, U*S, d]
-
-        # Head -> feedback vector
         out = self.head(h)                                                 # [B, F]
         return out
 
@@ -322,13 +279,9 @@ def save_model(model, path):
     torch.save(model.state_dict(), path)
 
 def manage_saved_models(model_dir, keep_last):
-    """
-    Remove all but the last N models (sorted by epoch in filename)
-    """
     model_files = [f for f in os.listdir(model_dir) if f.startswith("model-epoch") and f.endswith(".pt")]
     if len(model_files) <= keep_last:
         return
-    # Extract epoch number
     def get_epoch(f):
         try:
             return int(f.split("model-epoch")[1].split(".pt")[0])
@@ -342,21 +295,83 @@ def manage_saved_models(model_dir, keep_last):
             print(f"Warning: could not remove {f}: {e}")
 
 # -----------------------------
+# Permutation symmetrization for eval
+# -----------------------------
+def forward_with_symmetrization(model, xb, *, num_users, num_slots, out_dim, perms:int,
+                                perm_users:bool, perm_slots:bool):
+    if perms <= 0:
+        return model(xb)
+
+    device = xb.device
+    B = xb.size(0)
+
+    # If output can be reshaped per-slot, do it to unpermute slots
+    per_slot_dim = None
+    if perm_slots and out_dim % num_slots == 0:
+        per_slot_dim = out_dim // num_slots
+
+    preds = []
+    with torch.no_grad():
+        for _ in range(perms):
+            x_pert = xb
+            inv_slot = None
+
+            if perm_users:
+                p_u = torch.randperm(num_users, device=device)
+                x_pert = x_pert[:, p_u, :]
+
+            if perm_slots:
+                p_s = torch.randperm(num_slots, device=device)
+                x_pert = x_pert[:, :, p_s]
+                if per_slot_dim is not None:
+                    inv = torch.empty_like(p_s)
+                    inv[p_s] = torch.arange(num_slots, device=device)
+                    inv_slot = inv
+
+            y = model(x_pert)  # [B, F]
+
+            if perm_slots and per_slot_dim is not None:
+                y = y.view(B, num_slots, per_slot_dim)
+                if inv_slot is not None:
+                    y = y[:, inv_slot, :]
+                y = y.reshape(B, out_dim)
+
+            preds.append(y)
+
+    return torch.stack(preds, dim=0).mean(dim=0)
+
+# -----------------------------
 # Training/validation loop
 # -----------------------------
-def run_epoch(model, loader, criterion, optimizer, device, train, grad_clip, batch_limit, scheduler=None, step_per_batch=False):
+def run_epoch(model, loader, criterion, optimizer, device, train, grad_clip, batch_limit,
+              scheduler=None, step_per_batch=False, eval_sym=None):
     if train:
         model.train()
     else:
         model.eval()
+
     total_loss = 0.0
     n = 0
     batch_count = 0
+
     with torch.set_grad_enabled(train):
         for xb, yb in loader:
             xb = xb.to(device)
             yb = yb.to(device)
-            pred = model(xb)
+
+            if (not train) and eval_sym is not None:
+                pred = forward_with_symmetrization(
+                    model, xb,
+                    num_users=eval_sym["U"],
+                    num_slots=eval_sym["S"],
+                    out_dim=eval_sym["F"],
+                    perms=eval_sym["perms"],
+                    perm_users=eval_sym["perm_users"],
+                    perm_slots=eval_sym["perm_slots"],
+                )
+            else:
+                pred = model(xb)
+
             loss = criterion(pred, yb)
 
             if train:
@@ -373,6 +388,7 @@ def run_epoch(model, loader, criterion, optimizer, device, train, grad_clip, bat
             batch_count += 1
             if batch_count >= batch_limit:
                 break
+
     return total_loss / max(1, n)
 
 def train(
@@ -385,9 +401,6 @@ def train(
     run_dir,
     dataset,
 ):
-    """
-    Main training loop, model setup, logging, and saving.
-    """
     # -----------------------------
     # Train/val split + DataLoaders
     # -----------------------------
@@ -402,20 +415,21 @@ def train(
     steps_per_epoch_effective = min(steps_per_epoch, args.batches_per_epoch)
 
     # -----------------------------
-    # Instantiate model, loss, optim
+    # Instantiate model
     # -----------------------------
+    model_dropout = 0.0 if args.zero_reg else args.model_dropout
     model = ActionToFeedbackTransformer(
         num_users=U,
         num_slots=S,
         feedback_dim=F,
-        d_model=128,
-        nhead=8,
-        num_layers=4,
-        dim_feedforward=256,
-        dropout=0.1,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_layers=args.num_layers,
+        dim_feedforward=args.dim_feedforward,
+        dropout=model_dropout,
     ).to(args.device)
 
-    # If resume is requested and model-best.pt exists, load weights
+    # Resume weights if requested
     if getattr(args, "resume", False):
         model_best_path = os.path.join(run_dir, "model-best.pt")
         if os.path.exists(model_best_path):
@@ -425,12 +439,16 @@ def train(
         else:
             print(f"[resume] model-best.pt not found in {run_dir}, starting from scratch.")
 
-
+    # -----------------------------
+    # Loss, Optim, Schedulers
+    # -----------------------------
     criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    weight_decay = 0.0 if args.zero_reg else args.weight_decay
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
 
     if not args.warmup_cosine:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
+        step_per_batch = False
     else:
         total_steps = args.epochs * steps_per_epoch_effective
         warmup_steps = max(3 * steps_per_epoch_effective, int(0.03 * total_steps))
@@ -439,46 +457,80 @@ def train(
 
         def lr_lambda(step):
             if step < warmup_steps:
-                return (step + 1) / warmup_steps
+                return (step + 1) / max(1, warmup_steps)
             t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
             return eta_min / base_lr + 0.5 * (1 - eta_min / base_lr) * (1 + math.cos(math.pi * t))
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        step_per_batch = True
 
-    best_val = float("inf")
-    best_state = None
-    model_save_dir = run_dir
-
-    # --- Training log file logic ---
-    # If resuming, create a new log file with a unique name (timestamped)
-    if getattr(args, "resume", False):
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        train_log_path = os.path.join(run_dir, f"training-generator-resume-{timestamp}.jsonl")
-    else:
-        train_log_path = os.path.join(run_dir, "training-generator.jsonl")
     # -----------------------------
+    # SWA support (epoch-based start)
+    # -----------------------------
+    use_swa = args.swa
+    swa_model = None
+    swa_start_epoch = None
+    if use_swa:
+        swa_model = AveragedModel(model)
+        if args.swa_start_epoch is not None:
+            swa_start_epoch = args.swa_start_epoch
+        else:
+            swa_start_epoch = max(1, int(args.swa_start_frac * args.epochs))
+        print(f"[swa] Enabled. Start averaging at epoch {swa_start_epoch} "
+              f"({'{:.0%}'.format(args.swa_start_frac)} of training)" if args.swa_start_epoch is None else "")
+
+    # -----------------------------
+    # Eval symmetrization config
+    # -----------------------------
+    eval_sym = None
+    if args.eval_symmetrize > 0:
+        perm_users = args.symm_users
+        perm_slots = args.symm_slots or (not args.symm_users)  # default to slots if none specified
+        eval_sym = dict(
+            U=U, S=S, F=F,
+            perms=args.eval_symmetrize,
+            perm_users=perm_users,
+            perm_slots=perm_slots
+        )
+        print(f"[sym] Eval symmetrization: perms={args.eval_symmetrize}, users={perm_users}, slots={perm_slots}")
 
     # -----------------------------
     # Training loop
     # -----------------------------
+    best_val = float("inf")
+    best_state = None
+
+    # Logging file (timestamped when resuming)
+    if getattr(args, "resume", False):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        train_log_path = os.path.join(run_dir, f"training-generator-resume-{timestamp}.jsonl")
+    else:
+        train_log_path = os.path.join(run_dir, "training-generator.jsonl")
+
     with open(train_log_path, "w") as train_log_f:
         for epoch in range(1, args.epochs + 1):
             epoch_start = time.time()
+
             train_loss = run_epoch(
                 model, train_loader, criterion, optimizer, args.device, train=True,
                 grad_clip=args.grad_clip, batch_limit=args.batches_per_epoch,
-                scheduler=scheduler if args.warmup_cosine else None,
-                step_per_batch=args.warmup_cosine
+                scheduler=scheduler if step_per_batch else None,
+                step_per_batch=step_per_batch
             )
 
             val_loss = run_epoch(
                 model, val_loader, criterion, optimizer, args.device, train=False,
-                grad_clip=args.grad_clip, batch_limit=args.batches_per_epoch
+                grad_clip=args.grad_clip, batch_limit=args.batches_per_epoch,
+                eval_sym=eval_sym
             )
 
-            if not args.warmup_cosine:
+            if not step_per_batch:
                 scheduler.step()
+
+            # SWA: update running average after this epoch if past start
+            if use_swa and epoch >= swa_start_epoch:
+                swa_model.update_parameters(model)
+
             epoch_end = time.time()
             duration = epoch_end - epoch_start
 
@@ -498,31 +550,61 @@ def train(
             train_log_f.write(json.dumps(log_entry) + "\n")
             train_log_f.flush()
 
-            print(f"[{epoch:03d}/{args.epochs}] train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  lr={current_lr:.2e}  duration={duration:.2f}s")
+            print(f"[{epoch:03d}/{args.epochs}] train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  "
+                  f"lr={current_lr:.2e}  duration={duration:.2f}s")
 
             # Save model at intervals
             if args.epoch_save_interval > 0 and (epoch % args.epoch_save_interval == 0 or epoch == args.epochs):
-                model_path = os.path.join(model_save_dir, f"model-epoch{epoch}.pt")
+                model_path = os.path.join(run_dir, f"model-epoch{epoch}.pt")
                 save_model(model, model_path)
                 print(f"Saved model at {model_path}")
-                manage_saved_models(model_save_dir, args.keep_last_models)
+                manage_saved_models(run_dir, args.keep_last_models)
 
-    # Restore best weights and save final model
+    # Restore best weights and save final model-best.pt
     if best_state is not None:
         model.load_state_dict(best_state)
         model.to(args.device)
         print(f"Restored best model with val_loss={best_val:.6f}")
-        best_model_path = os.path.join(model_save_dir, "model-best.pt")
+        best_model_path = os.path.join(run_dir, "model-best.pt")
         save_model(model, best_model_path)
         print(f"Saved best model at {best_model_path}")
 
+    # -----------------------------
+    # SWA finalization (evaluate and save)
+    # -----------------------------
+    if use_swa and swa_model is not None:
+        # If the model used BatchNorms, this updates BN stats; otherwise it's a no-op.
+        try:
+            update_bn(train_loader, swa_model, device=args.device)
+        except Exception:
+            pass
+
+        swa_model.to(args.device)
+        swa_val = run_epoch(
+            swa_model, DataLoader(val_ds, batch_size=args.batch_size, shuffle=False),
+            nn.MSELoss(), optimizer, args.device, train=False,
+            grad_clip=None, batch_limit=args.batches_per_epoch,
+            eval_sym=eval_sym
+        )
+        print(f"[swa] Validation loss: {swa_val:.6f}")
+
+        swa_path = os.path.join(run_dir, "model-swa.pt")
+        save_model(swa_model, swa_path)
+        print(f"[swa] Saved SWA model at {swa_path}")
+
+        # If SWA is better, promote it to best
+        if swa_val < best_val:
+            save_model(swa_model, os.path.join(run_dir, "model-best.pt"))
+            print(f"[swa] SWA improved best model. New best val_loss={swa_val:.6f}")
+
 def parse_args():
     parser = argparse.ArgumentParser()
+    # Training & data
     parser.add_argument('--epoch-save-interval', type=int, default=200, help='Save model every N epochs')
     parser.add_argument('--result-dir', type=str, default=None, help='Override result dir')
-    parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS, help='Keep only the last X saved models (default=2)')
-    parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help=f'Random seed (default={DEFAULT_SEED})')
-    parser.add_argument('--run-dir', type=str, default="res-1p-u10-s10-e1000-b1000-s100", help='Result directory (default: res-1p-u10-s10-e1000-b1000-s100)')
+    parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS, help='Keep only the last X saved models')
+    parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help='Random seed')
+    parser.add_argument('--run-dir', type=str, default="res-1p-u10-s10-e1000-b1000-s100", help='Result directory')
     parser.add_argument('--use-energy-feedback', action='store_true', help='Use per-slot counts instead of undecoded one-hot')
     parser.add_argument('--epochs', type=int, default=500, help='Number of epochs')
     parser.add_argument('--batch-size', type=int, default=128, help='Batch size')
@@ -531,29 +613,46 @@ def parse_args():
     parser.add_argument('--batches-per-epoch', type=int, default=1000, help='Limit to this many batches per epoch')
     parser.add_argument('--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--resume', action='store_true', help='Resume training from model-best.pt if it exists')
-    parser.add_argument('--warmup-cosine', action='store_true', help='Per-batch linear warmup (~3% or 3 epochs) then cosine decay to eta_min=1e-6.')
+
+    # LR scheduling
+    parser.add_argument('--warmup-cosine', action='store_true', help='Per-batch linear warmup then cosine decay to eta_min')
     parser.add_argument('--lr', type=float, default=3e-4, help='Base learning rate')
+    parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay (AdamW)')
+
+    # Zero-reg finisher
+    parser.add_argument('--zero-reg', action='store_true', help='Turn off dropout and weight decay for last-mile polishing')
+    parser.add_argument('--model-dropout', type=float, default=0.1, help='Model dropout (ignored if --zero-reg)')
+
+    # Model size
+    parser.add_argument('--d_model', type=int, default=128, help='Transformer d_model')
+    parser.add_argument('--nhead', type=int, default=8, help='Transformer nhead')
+    parser.add_argument('--num_layers', type=int, default=4, help='Transformer encoder layers')
+    parser.add_argument('--dim_feedforward', type=int, default=256, help='Transformer FFN dim')
+
+    # SWA
+    parser.add_argument('--swa', action='store_true', help='Enable Stochastic Weight Averaging')
+    parser.add_argument('--swa-start-epoch', type=int, default=None, help='Epoch to start SWA (default: use fraction)')
+    parser.add_argument('--swa-start-frac', type=float, default=0.7, help='Fraction of total epochs after which to start SWA')
+
+    # Eval-time permutation symmetrization
+    parser.add_argument('--eval-symmetrize', type=int, default=0, help='Average over N random permutations at eval (0 disables)')
+    parser.add_argument('--symm-users', action='store_true', help='Permute users during eval symmetrization')
+    parser.add_argument('--symm-slots', action='store_true', help='Permute slots during eval symmetrization')
+
     return parser.parse_args()
 
 def main():
     args = parse_args()
     set_seed(args.seed)
 
-    # Determine run directory
     run_dir = args.result_dir if args.result_dir is not None else args.run_dir
     os.makedirs(run_dir, exist_ok=True)
     DATASET_OUT = os.path.join(run_dir, "actions_feedback_dataset.pt")
 
-    # -----------------
-    # Load config (always), but only load log if building dataset
     config = load_config(run_dir)
     num_slots_cfg = int(config["num_slots"])
     num_users_cfg = int(config["num_users"])
 
-    # -----------------------------------------------------------
-    # 1) Build dataset: actions (one-hot) -> feedback vectors
-    #    Only build and save if DATASET_OUT does not exist
-    # -----------------------------------------------------------
     one_hot_actions, feedback_vectors, U, S, num_samples, num_records_with_actions = load_or_build_actions_feedback_dataset(
         run_dir,
         DATASET_OUT,
@@ -563,9 +662,6 @@ def main():
         verbose=args.verbose
     )
 
-    # -------------------------------------------------------------------
-    # 3) Define PyTorch Dataset and DataLoader (no model defined here)
-    # -------------------------------------------------------------------
     dataset = ActionsFeedbackDataset(one_hot_actions, feedback_vectors)
     if args.verbose:
         dataloader = DataLoader(dataset, batch_size=64, shuffle=True, drop_last=False)
@@ -573,8 +669,8 @@ def main():
         xb, yb = first_batch
         print(f"[dataloader] batch x: {tuple(xb.shape)}, y: {tuple(yb.shape)}")
 
-    N, U, S = one_hot_actions.shape   # [N, num_users, num_slots]
-    F = feedback_vectors.shape[1]     # feedback_dim (typically 3*S)
+    N, U, S = one_hot_actions.shape
+    F = feedback_vectors.shape[1]
 
     args.device = get_device()
     print(f"Using device: {args.device}")
