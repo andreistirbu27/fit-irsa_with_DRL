@@ -410,6 +410,16 @@ def train(
         dropout=0.1,
     ).to(args.device)
 
+    # If resume is requested and model-best.pt exists, load weights
+    if getattr(args, "resume", False):
+        model_best_path = os.path.join(run_dir, "model-best.pt")
+        if os.path.exists(model_best_path):
+            print(f"[resume] Loading model weights from {model_best_path}")
+            state_dict = torch.load(model_best_path, map_location=args.device)
+            model.load_state_dict(state_dict)
+        else:
+            print(f"[resume] model-best.pt not found in {run_dir}, starting from scratch.")
+
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
@@ -484,6 +494,7 @@ def parse_args():
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping value')
     parser.add_argument('--batches-per-epoch', type=int, default=1000, help='Limit to this many batches per epoch')
     parser.add_argument('--verbose', action='store_true', help='Verbose output')
+    parser.add_argument('--resume', action='store_true', help='Resume training from model-best.pt if it exists')
     return parser.parse_args()
 
 def main():
