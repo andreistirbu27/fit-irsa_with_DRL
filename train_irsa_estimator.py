@@ -255,6 +255,7 @@ class ActionToFeedbackTransformer(nn.Module):
 # -----------------------------
 # Device and seed utilities
 # -----------------------------
+
 def get_device():
     if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
         return torch.device('mps')
@@ -262,6 +263,7 @@ def get_device():
         return torch.device('cuda')
     else:
         return torch.device('cpu')
+
 
 def set_seed(seed):
     import random
@@ -275,18 +277,22 @@ def set_seed(seed):
 # -----------------------------
 # Model saving and management
 # -----------------------------
+
 def save_model(model, path):
     torch.save(model.state_dict(), path)
+
 
 def manage_saved_models(model_dir, keep_last):
     model_files = [f for f in os.listdir(model_dir) if f.startswith("model-epoch") and f.endswith(".pt")]
     if len(model_files) <= keep_last:
         return
+
     def get_epoch(f):
         try:
             return int(f.split("model-epoch")[1].split(".pt")[0])
         except Exception:
             return -1
+
     model_files = sorted(model_files, key=get_epoch)
     for f in model_files[:-keep_last]:
         try:
@@ -295,23 +301,41 @@ def manage_saved_models(model_dir, keep_last):
             print(f"Warning: could not remove {f}: {e}")
 
 # -----------------------------
-# Permutation symmetrization for eval
+# Permutation symmetrization for eval (slot-major aware)
 # -----------------------------
-def forward_with_symmetrization(model, xb, *, num_users, num_slots, out_dim, perms:int,
-                                perm_users:bool, perm_slots:bool):
+
+def forward_with_symmetrization(
+    model,
+    xb,
+    *,
+    num_users,
+    num_slots,
+    out_dim,
+    perms: int,
+    perm_users: bool,
+    perm_slots: bool,
+    slot_major: bool,
+):
+    """
+    If permuting slots, correctly un-permute along the *slot* axis.
+    - slot_major=True  => reshape [B, S, C]
+    - slot_major=False => reshape [B, C, S]
+    """
     if perms <= 0:
         return model(xb)
 
     device = xb.device
     B = xb.size(0)
 
-    # If output can be reshaped per-slot, do it to unpermute slots
-    per_slot_dim = None
-    if perm_slots and out_dim % num_slots == 0:
-        per_slot_dim = out_dim // num_slots
+    if perm_slots and (out_dim % num_slots != 0):
+        raise ValueError(
+            f"Slot permutation requested but feedback_dim={out_dim} isn't divisible by num_slots={num_slots}."
+        )
 
+    C = out_dim // num_slots if perm_slots else None
     preds = []
-    with torch.no_grad():
+
+    with torch.inference_mode():
         for _ in range(perms):
             x_pert = xb
             inv_slot = None
@@ -323,18 +347,18 @@ def forward_with_symmetrization(model, xb, *, num_users, num_slots, out_dim, per
             if perm_slots:
                 p_s = torch.randperm(num_slots, device=device)
                 x_pert = x_pert[:, :, p_s]
-                if per_slot_dim is not None:
-                    inv = torch.empty_like(p_s)
-                    inv[p_s] = torch.arange(num_slots, device=device)
-                    inv_slot = inv
+                inv_slot = torch.empty_like(p_s)
+                inv_slot[p_s] = torch.arange(num_slots, device=device)
 
             y = model(x_pert)  # [B, F]
 
-            if perm_slots and per_slot_dim is not None:
-                y = y.view(B, num_slots, per_slot_dim)
-                if inv_slot is not None:
-                    y = y[:, inv_slot, :]
-                y = y.reshape(B, out_dim)
+            if perm_slots:
+                if slot_major:
+                    # Layout [S, C] => [B, S, C], un-permute slot dim
+                    y = y.view(B, num_slots, C).index_select(1, inv_slot).reshape(B, out_dim)
+                else:
+                    # Layout [C, S] => [B, C, S], un-permute slot dim
+                    y = y.view(B, C, num_slots).index_select(2, inv_slot).reshape(B, out_dim)
 
             preds.append(y)
 
@@ -343,8 +367,20 @@ def forward_with_symmetrization(model, xb, *, num_users, num_slots, out_dim, per
 # -----------------------------
 # Training/validation loop
 # -----------------------------
-def run_epoch(model, loader, criterion, optimizer, device, train, grad_clip, batch_limit,
-              scheduler=None, step_per_batch=False, eval_sym=None):
+
+def run_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    device,
+    train,
+    grad_clip,
+    batch_limit,
+    scheduler=None,
+    step_per_batch=False,
+    eval_sym=None,
+):
     if train:
         model.train()
     else:
@@ -361,13 +397,15 @@ def run_epoch(model, loader, criterion, optimizer, device, train, grad_clip, bat
 
             if (not train) and eval_sym is not None:
                 pred = forward_with_symmetrization(
-                    model, xb,
+                    model,
+                    xb,
                     num_users=eval_sym["U"],
                     num_slots=eval_sym["S"],
                     out_dim=eval_sym["F"],
                     perms=eval_sym["perms"],
                     perm_users=eval_sym["perm_users"],
                     perm_slots=eval_sym["perm_slots"],
+                    slot_major=eval_sym["slot_major"],
                 )
             else:
                 pred = model(xb)
@@ -390,6 +428,7 @@ def run_epoch(model, loader, criterion, optimizer, device, train, grad_clip, bat
                 break
 
     return total_loss / max(1, n)
+
 
 def train(
     args,
@@ -476,8 +515,10 @@ def train(
             swa_start_epoch = args.swa_start_epoch
         else:
             swa_start_epoch = max(1, int(args.swa_start_frac * args.epochs))
-        print(f"[swa] Enabled. Start averaging at epoch {swa_start_epoch} "
-              f"({'{:.0%}'.format(args.swa_start_frac)} of training)" if args.swa_start_epoch is None else "")
+        print(
+            f"[swa] Enabled. Start averaging at epoch {swa_start_epoch} "
+            f"({'{:.0%}'.format(args.swa_start_frac)} of training)" if args.swa_start_epoch is None else ""
+        )
 
     # -----------------------------
     # Eval symmetrization config
@@ -486,13 +527,15 @@ def train(
     if args.eval_symmetrize > 0:
         perm_users = args.symm_users
         perm_slots = args.symm_slots or (not args.symm_users)  # default to slots if none specified
+        slot_major = (args.fb_layout == 'slot-major')
         eval_sym = dict(
             U=U, S=S, F=F,
             perms=args.eval_symmetrize,
             perm_users=perm_users,
-            perm_slots=perm_slots
+            perm_slots=perm_slots,
+            slot_major=slot_major,
         )
-        print(f"[sym] Eval symmetrization: perms={args.eval_symmetrize}, users={perm_users}, slots={perm_slots}")
+        print(f"[sym] Eval symmetrization: perms={args.eval_symmetrize}, users={perm_users}, slots={perm_slots}, layout={args.fb_layout}")
 
     # -----------------------------
     # Training loop
@@ -597,6 +640,7 @@ def train(
             save_model(swa_model, os.path.join(run_dir, "model-best.pt"))
             print(f"[swa] SWA improved best model. New best val_loss={swa_val:.6f}")
 
+
 def parse_args():
     parser = argparse.ArgumentParser()
     # Training & data
@@ -639,7 +683,12 @@ def parse_args():
     parser.add_argument('--symm-users', action='store_true', help='Permute users during eval symmetrization')
     parser.add_argument('--symm-slots', action='store_true', help='Permute slots during eval symmetrization')
 
+    # Feedback layout for correct un-permute during slot symmetrization
+    parser.add_argument('--fb-layout', choices=['slot-major', 'type-major'], default='slot-major',
+                        help='Layout of feedback vector across slots/channels. slot-major means [S, C]; type-major means [C, S].')
+
     return parser.parse_args()
+
 
 def main():
     args = parse_args()
@@ -651,7 +700,7 @@ def main():
 
     config = load_config(run_dir)
     num_slots_cfg = int(config["num_slots"])
-    num_users_cfg = int(config["num_users"])
+    num_users_cfg = int(config["num_users"])\
 
     one_hot_actions, feedback_vectors, U, S, num_samples, num_records_with_actions = load_or_build_actions_feedback_dataset(
         run_dir,
@@ -685,6 +734,7 @@ def main():
         run_dir=run_dir,
         dataset=dataset,
     )
+
 
 if __name__ == "__main__":
     main()
