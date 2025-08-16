@@ -26,8 +26,8 @@ DEFAULT_SEED = 1000
 
 def parse_args():
     parser = argparse.ArgumentParser(description="IRSA 2-Phases Training")
-    parser.add_argument('--users', type=int, default=5, help='Number of users (required)')
-    parser.add_argument('--slots', type=int, default=3, help='Number of slots (required)')
+    parser.add_argument('--users', type=int, default=5, help='Number of users')
+    parser.add_argument('--slots', type=int, default=3, help='Number of slots')
     parser.add_argument('--torch-single-core', default=False, action="store_true") 
     parser.add_argument('--input-obs-dim', type=int, default=3)
     parser.add_argument('--hidden-dim', type=int, default=DEFAULT_HIDDEN_DIM)
@@ -41,11 +41,11 @@ def parse_args():
     parser.add_argument('--epoch-save-interval', type=int, default=200, help='Save model every N epochs')
     parser.add_argument('--result-dir', type=str, default=None, help='Override result dir')
     parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS, help='Keep only the last X saved models (default=2)')
-    parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help='Random seed (default=1)')
+    parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help=f'Random seed (default={DEFAULT_SEED})')
     parser.add_argument('--gpu', action='store_true', help='Use GPU (cuda or mps) if available')
     parser.add_argument('--epoch-half-lr-interval', type=int, default=None, help='If set, halve learning rate every N epochs')
     parser.add_argument('--one-phase', action='store_true', help='Run only Round 1 (Round 2 disabled; equivalent to 0 slots in phase 2)')
-    parser.add_argument('--energy-feedback', action='store_true', help='Use scalar energy feedback (fraction of undecoded users after R1) instead of 3*S indices')
+    parser.add_argument('--energy-feedback', action='store_true', help='Use scalar energy feedback per-slot occupancy counts replace the undecoded one-hot.')
 
     args = parser.parse_args()
     # --log-action implies --log
@@ -80,7 +80,7 @@ def make_result_dir(cfg):
             parts.append(f"lr{cfg['learning_rate']}")
         # Only add seed if it is not the default
         if cfg.get('seed', DEFAULT_SEED) != DEFAULT_SEED:
-            parts.append(f"s{cfg['seed']}")
+            parts.append(f"seed{cfg['seed']}")
         result_dir = "-".join(parts)
     os.makedirs(result_dir, exist_ok=True)
     return result_dir
@@ -155,23 +155,6 @@ def load_model_from_dir(result_dir, which="final", device=None):
     feedback_dim = 3 * cfg['num_slots']
     input_dim = cfg['input_obs_dim'] + feedback_dim + prev_action_dim
 
-    # Define PolicyNetUser class (must match training definition)
-    class PolicyNetUser(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, cfg['hidden_dim']),
-                nn.ReLU(),
-                nn.Linear(cfg['hidden_dim'], cfg['num_slots'])
-            )
-            with torch.no_grad():
-                last = self.net[-1]
-                if isinstance(last, nn.Linear):
-                    last.bias.fill_(-1.4)
-
-        def forward(self, x):
-            return self.net(x)
-
     # Determine model file
     if which == "final":
         model_path = os.path.join(result_dir, "policy_final.pt")
@@ -186,15 +169,16 @@ def load_model_from_dir(result_dir, which="final", device=None):
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
     # Instantiate and load model
-    model = PolicyNetUser()
-    state_dict = torch.load(model_path, map_location=device)
+    # Determine map_location
+    map_loc = device if device is not None else 'cpu'
+
+    model = PolicyNetUser(input_dim, cfg['hidden_dim'], cfg['num_slots'])
+    state_dict = torch.load(model_path, map_location=map_loc)
     model.load_state_dict(state_dict)
     if device is not None:
         model.to(device)
     model.eval()
     return model, cfg
-
-
 
 
 # === Single-user policy ===
@@ -571,6 +555,11 @@ def train(policy, optimizer, cfg,
                 "train_phase_sec": train_phase_duration
             }
             log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_actions_r1, batch_actions_r2, log_action, log_file, timing_info=timing_info)
+
+        # after logging/printing per-epoch stats
+        if cfg.get('epoch_save_interval') and (epoch + 1) % cfg['epoch_save_interval'] == 0:
+            save_model(policy, cfg['result_dir'], epoch=epoch + 1)
+            cleanup_old_models(cfg['result_dir'], keep_last=cfg.get('keep_last_models', DEFAULT_KEEP_LAST_MODELS))
 
         if epoch % 100 == 0:
             print(f"Epoch {epoch}: "
