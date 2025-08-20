@@ -145,11 +145,11 @@ def compute_array_stats(
 #%%
 
 
-def get_load_data(nb_users, nb_slots=20, one_phase=False, seed=1):
+def get_load_data(nb_users, nb_slots=20, one_phase=False, seed=1, prefix="-load"):
     if one_phase:
-        dir_name = f"res-long/res-load-1p-u{nb_users}-s{nb_slots}-e1000-b1000-s{seed}"
+        dir_name = f"res-long/res{prefix}-1p-u{nb_users}-s{nb_slots}-e1000-b1000-s{seed}"
     else:
-        dir_name = f"res-long/res-load-u{nb_users}-s{nb_slots//2}-e1000-b1000-s{seed}"
+        dir_name = f"res-long/res{prefix}-u{nb_users}-s{nb_slots//2}-e1000-b1000-s{seed}"
     log_file_name = find_jsonl_file(dir_name)
     all_data = load_jsonl(log_file_name)
 
@@ -169,81 +169,95 @@ def get_load_data(nb_users, nb_slots=20, one_phase=False, seed=1):
 import numpy as np
 import matplotlib.pyplot as plt
 
-user_range = range(2, 31)  # Users from 2 to 30
-seeds = range(1, 5)        # Seeds 1 to 4
+def plot_throughtput_vs_users_slots(prefix="-load", normalize=False, nb_slots=20, ylim=None, fig_file_name=None):
+    if nb_slots is not None:
+        user_range = range(2, 31)  # Users from 2 to 30
+    else:
+        user_range = range(2, 31, 2)  # Users from 2 to 30, even number
+    seeds = range(1, 5)        # Seeds 1 to 4
 
-# Store results per seed and per phase
-results = {
-    True: {  # one_phase=True
-        "avgs": {seed: [] for seed in seeds},
-        "lowers": {seed: [] for seed in seeds},
-        "uppers": {seed: [] for seed in seeds},
-    },
-    False: {  # one_phase=False
-        "avgs": {seed: [] for seed in seeds},
-        "lowers": {seed: [] for seed in seeds},
-        "uppers": {seed: [] for seed in seeds},
+    # Store results per seed and per phase
+    results = {
+        True: {  # one_phase=True
+            "avgs": {seed: [] for seed in seeds},
+            "lowers": {seed: [] for seed in seeds},
+            "uppers": {seed: [] for seed in seeds},
+        },
+        False: {  # one_phase=False
+            "avgs": {seed: [] for seed in seeds},
+            "lowers": {seed: [] for seed in seeds},
+            "uppers": {seed: [] for seed in seeds},
+        }
     }
-}
 
-for nb_users in user_range:
-    for one_phase in [False, True]:
-        for seed in seeds:
-            try:
-                _, avg, lower, upper = get_load_data(nb_users, seed=seed, one_phase=one_phase)
-                results[one_phase]["avgs"][seed].append(avg)
-                results[one_phase]["lowers"][seed].append(lower)
-                results[one_phase]["uppers"][seed].append(upper)
-            except Exception as e:
-                print(f"Skipping users={nb_users}, seed={seed}, one_phase={one_phase} due to error: {e}")
-                results[one_phase]["avgs"][seed].append(np.nan)
-                results[one_phase]["lowers"][seed].append(np.nan)
-                results[one_phase]["uppers"][seed].append(np.nan)
+    for nb_users in user_range:
+        for one_phase in [False, True]:
+            for seed in seeds:
+                try:
+                    actual_nb_slots = nb_users if (nb_slots is None) else nb_slots                    
+                    _, avg, lower, upper = get_load_data(nb_users, nb_slots=actual_nb_slots, seed=seed, one_phase=one_phase, prefix=prefix)
+                    if normalize:
+                        avg = avg / nb_users
+                        lower = lower / nb_users # XXX: check
+                        upper = upper / nb_users
+                    results[one_phase]["avgs"][seed].append(avg)
+                    results[one_phase]["lowers"][seed].append(lower)
+                    results[one_phase]["uppers"][seed].append(upper)
+                except Exception as e:
+                    print(f"Skipping users={nb_users}, seed={seed}, one_phase={one_phase} due to error: {e}")
+                    results[one_phase]["avgs"][seed].append(np.nan)
+                    results[one_phase]["lowers"][seed].append(np.nan)
+                    results[one_phase]["uppers"][seed].append(np.nan)
 
-x = np.array(list(user_range))
-bar_width = 0.18
-offsets = np.linspace(-bar_width*1.5, bar_width*1.5, len(seeds))
+    x = np.array(list(user_range))
+    bar_width = 0.18
+    offsets = np.linspace(-bar_width*1.5, bar_width*1.5, len(seeds))
 
-plt.figure(figsize=(12,6))
-colors = plt.cm.tab10.colors
+    plt.figure(figsize=(12,6))
+    colors = plt.cm.tab10.colors
 
-# Plot one_phase=False bars first (behind)
-for i, seed in enumerate(seeds):
-    y = np.array(results[False]["avgs"][seed])
-    yerr_lower = y - np.array(results[False]["lowers"][seed])
-    yerr_upper = np.array(results[False]["uppers"][seed]) - y
-    plt.bar(
-        x + offsets[i], y, width=bar_width*1.15,  # slightly longer bars
-        yerr=[yerr_lower, yerr_upper],
-        align='center', alpha=0.4, ecolor='black', capsize=4,
-        label=f"Seed {seed} (two-phase)", color=colors[i % len(colors)], zorder=1
-    )
+    # Plot one_phase=False bars first (behind)
+    for i, seed in enumerate(seeds):
+        y = np.array(results[False]["avgs"][seed])
+        yerr_lower = y - np.array(results[False]["lowers"][seed])
+        yerr_upper = np.array(results[False]["uppers"][seed]) - y
+        plt.bar(
+            x + offsets[i], y, width=bar_width*1.15,  # slightly longer bars
+            yerr=[yerr_lower, yerr_upper],
+            align='center', alpha=0.4, ecolor='black', capsize=4,
+            label=f"Seed {seed} (two-phase)", color=colors[i % len(colors)], zorder=1
+        )
 
-# Plot one_phase=True bars in front
-for i, seed in enumerate(seeds):
-    y = np.array(results[True]["avgs"][seed])
-    yerr_lower = y - np.array(results[True]["lowers"][seed])
-    yerr_upper = np.array(results[True]["uppers"][seed]) - y
-    plt.bar(
-        x + offsets[i], y, width=bar_width,
-        yerr=[yerr_lower, yerr_upper],
-        align='center', alpha=0.8, ecolor='black', capsize=4,
-        label=f"Seed {seed} (one-phase)", color=colors[i % len(colors)], zorder=2, edgecolor='k'
-    )
+    # Plot one_phase=True bars in front
+    for i, seed in enumerate(seeds):
+        y = np.array(results[True]["avgs"][seed])
+        yerr_lower = y - np.array(results[True]["lowers"][seed])
+        yerr_upper = np.array(results[True]["uppers"][seed]) - y
+        plt.bar(
+            x + offsets[i], y, width=bar_width,
+            yerr=[yerr_lower, yerr_upper],
+            align='center', alpha=0.8, ecolor='black', capsize=4,
+            label=f"Seed {seed} (one-phase)", color=colors[i % len(colors)], zorder=2, edgecolor='k'
+        )
 
-plt.xlabel("Number of Users")
-plt.ylabel("Mean Decoded")
-plt.title("Mean Decoded Users vs Number of Users (per seed, with CI)\n(one-phase in front, two-phase behind)")
-plt.xticks(x)
-plt.grid(True, axis='y')
-plt.legend()
-plt.tight_layout()
-plt.ylim(10,12)
-plt.show()
+    plt.xlabel("Number of Users")
+    plt.ylabel("Mean Decoded")
+    plt.title("Mean Decoded Users vs Number of Users (per seed, with CI)\n(one-phase in front, two-phase behind)")
+    plt.xticks(x)
+    plt.grid(True, axis='y')
+    plt.legend()
+    plt.tight_layout()
+    if ylim is not None:
+        plt.ylim(*ylim)
+        #plt.ylim(10,12)
+    if fig_file_name is not None:
+        plt.savefig("throughput-vs-users-20slots.pdf")
+    plt.show()
 
 
 
-
+plot_throughtput_vs_users_slots(normalize=False, prefix="-load", nb_slots=20, ylim=(10,12), fig_file_name="throughput-vs-users-20slots.pdf")
+plot_throughtput_vs_users_slots(normalize=True, prefix="", nb_slots=None, ylim=None, fig_file_name="throughput-vs-users-and-slots.pdf")
 
 #%%
 
