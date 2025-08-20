@@ -23,6 +23,7 @@ DEFAULT_BATCH_SIZE = 50
 DEFAULT_LEARNING_RATE = 0.01
 DEFAULT_KEEP_LAST_MODELS = 2
 DEFAULT_SEED = 1000
+DEFAULT_NUM_LAYERS = 2
 
 def parse_args():
     parser = argparse.ArgumentParser(description="IRSA 2-Phases Training")
@@ -46,6 +47,7 @@ def parse_args():
     parser.add_argument('--epoch-half-lr-interval', type=int, default=None, help='If set, halve learning rate every N epochs')
     parser.add_argument('--one-phase', action='store_true', help='Run only Round 1 (Round 2 disabled; equivalent to 0 slots in phase 2)')
     parser.add_argument('--energy-feedback', action='store_true', help='Use scalar energy feedback per-slot occupancy counts replace the undecoded one-hot.')
+    parser.add_argument('--num-layers', type=int, default=DEFAULT_NUM_LAYERS, help='Number of layers in the model (default=2)')
 
     args = parser.parse_args()
     # --log-action implies --log
@@ -65,13 +67,15 @@ def make_result_dir(cfg):
     if cfg['result_dir'] is not None:
         result_dir = cfg['result_dir']
     else:
-        # Only include non-defaults for hidden-dim, epochs, batch-size, learning-rate
+        # Only include non-defaults for hidden-dim, epochs, batch-size, learning-rate, num-layers
         parts = [
             f"{base}-u{cfg['num_users']}",
             f"s{cfg['num_slots']}"
         ]
         if cfg['hidden_dim'] != DEFAULT_HIDDEN_DIM:
             parts.append(f"h{cfg['hidden_dim']}")
+        if cfg.get('num_layers', DEFAULT_NUM_LAYERS) != DEFAULT_NUM_LAYERS:
+            parts.append(f"nl{cfg['num_layers']}")
         if cfg['epochs'] != DEFAULT_EPOCHS:
             parts.append(f"e{cfg['epochs']}")
         if cfg['batch_size'] != DEFAULT_BATCH_SIZE:
@@ -172,7 +176,8 @@ def load_model_from_dir(result_dir, which="final", device=None):
     # Determine map_location
     map_loc = device if device is not None else 'cpu'
 
-    model = PolicyNetUser(input_dim, cfg['hidden_dim'], cfg['num_slots'])
+    num_layers = cfg.get('num_layers', DEFAULT_NUM_LAYERS)
+    model = PolicyNetUser(input_dim, cfg['hidden_dim'], cfg['num_slots'], num_layers=num_layers)
     state_dict = torch.load(model_path, map_location=map_loc)
     model.load_state_dict(state_dict)
     if device is not None:
@@ -183,13 +188,19 @@ def load_model_from_dir(result_dir, which="final", device=None):
 
 # === Single-user policy ===
 class PolicyNetUser(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_slots):
+    def __init__(self, input_dim, hidden_dim, num_slots, num_layers=DEFAULT_NUM_LAYERS):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_slots)   # logits per slot for THIS user
-        )
+        layers = []
+        # First layer
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.ReLU())
+        # Hidden layers
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+        # Output layer
+        layers.append(nn.Linear(hidden_dim, num_slots))   # logits per slot for THIS user
+        self.net = nn.Sequential(*layers)
         with torch.no_grad():
             last = self.net[-1]
             if isinstance(last, nn.Linear):
@@ -631,6 +642,7 @@ def main():
         'epoch_half_lr_interval': getattr(args, "epoch_half_lr_interval", None),
         'one_phase': getattr(args, 'one_phase', False),
         'energy_feedback': getattr(args, 'energy_feedback', False),
+        'num_layers': getattr(args, 'num_layers', DEFAULT_NUM_LAYERS),
     }
 
     # Derived dims
@@ -653,7 +665,7 @@ def main():
         log_f, log_path = None, None
 
     # === Run ===
-    policy = PolicyNetUser(input_dim, cfg['hidden_dim'], cfg['num_slots']).to(device)
+    policy = PolicyNetUser(input_dim, cfg['hidden_dim'], cfg['num_slots'], num_layers=cfg['num_layers']).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=cfg['learning_rate'])
     try:
         rewards, avg_unique, frac_decR1_txR2 = train(policy, optimizer, cfg, log_file=log_f, device=device)
