@@ -169,7 +169,7 @@ def get_load_data(nb_users, nb_slots=20, one_phase=False, seed=1, prefix="-load"
 import numpy as np
 import matplotlib.pyplot as plt
 
-def plot_throughtput_vs_users_slots(prefix="-load", normalize=False, nb_slots=20, ylim=None, fig_file_name=None):
+def plot_throughtput_vs_users_slots(prefix="-load", normalize=False, nb_slots=20, xlim=None, ylim=None, fig_file_name=None):
     if nb_slots is not None:
         user_range = range(2, 31)  # Users from 2 to 30
     else:
@@ -247,17 +247,19 @@ def plot_throughtput_vs_users_slots(prefix="-load", normalize=False, nb_slots=20
     plt.grid(True, axis='y')
     plt.legend()
     plt.tight_layout()
+    if xlim is not None:
+        plt.xlim(*xlim)    
     if ylim is not None:
         plt.ylim(*ylim)
         #plt.ylim(10,12)
     if fig_file_name is not None:
-        plt.savefig("throughput-vs-users-20slots.pdf")
+        plt.savefig(fig_file_name)
     plt.show()
 
 
 
-plot_throughtput_vs_users_slots(normalize=False, prefix="-load", nb_slots=20, ylim=(10,12), fig_file_name="throughput-vs-users-20slots.pdf")
-plot_throughtput_vs_users_slots(normalize=True, prefix="", nb_slots=None, ylim=None, fig_file_name="throughput-vs-users-and-slots.pdf")
+plot_throughtput_vs_users_slots(normalize=False, prefix="-load", nb_slots=20, xlim=(3.5,30.5), ylim=(9.5,12), fig_file_name="throughput-vs-users-20slots.pdf")
+plot_throughtput_vs_users_slots(normalize=True, prefix="", nb_slots=None, ylim=(0.5,3/4), fig_file_name="throughput-vs-users-and-slots.pdf")
 
 #%%
 
