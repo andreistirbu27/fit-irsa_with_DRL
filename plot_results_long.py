@@ -153,7 +153,7 @@ def get_load_data(nb_users, nb_slots=20, one_phase=False, seed=1):
     log_file_name = find_jsonl_file(dir_name)
     all_data = load_jsonl(log_file_name)
 
-    NB_PARTS = 4 # we take statistics on the last 1/NB_PARTS
+    NB_PARTS = 10 # we take statistics on the last 1/NB_PARTS
 
     K = int(len(all_data)//NB_PARTS)
     assert (len(all_data) % K) == 0
@@ -172,23 +172,33 @@ import matplotlib.pyplot as plt
 user_range = range(2, 31)  # Users from 2 to 30
 seeds = range(1, 5)        # Seeds 1 to 4
 
-# Store results per seed
-decoded_avgs_per_seed = {seed: [] for seed in seeds}
-decoded_lowers_per_seed = {seed: [] for seed in seeds}
-decoded_uppers_per_seed = {seed: [] for seed in seeds}
+# Store results per seed and per phase
+results = {
+    True: {  # one_phase=True
+        "avgs": {seed: [] for seed in seeds},
+        "lowers": {seed: [] for seed in seeds},
+        "uppers": {seed: [] for seed in seeds},
+    },
+    False: {  # one_phase=False
+        "avgs": {seed: [] for seed in seeds},
+        "lowers": {seed: [] for seed in seeds},
+        "uppers": {seed: [] for seed in seeds},
+    }
+}
 
 for nb_users in user_range:
-    for seed in seeds:
-        try:
-            _, avg, lower, upper = get_load_data(nb_users, seed=seed, one_phase=True)
-            decoded_avgs_per_seed[seed].append(avg)
-            decoded_lowers_per_seed[seed].append(lower)
-            decoded_uppers_per_seed[seed].append(upper)
-        except Exception as e:
-            print(f"Skipping users={nb_users}, seed={seed} due to error: {e}")
-            decoded_avgs_per_seed[seed].append(np.nan)
-            decoded_lowers_per_seed[seed].append(np.nan)
-            decoded_uppers_per_seed[seed].append(np.nan)
+    for one_phase in [False, True]:
+        for seed in seeds:
+            try:
+                _, avg, lower, upper = get_load_data(nb_users, seed=seed, one_phase=one_phase)
+                results[one_phase]["avgs"][seed].append(avg)
+                results[one_phase]["lowers"][seed].append(lower)
+                results[one_phase]["uppers"][seed].append(upper)
+            except Exception as e:
+                print(f"Skipping users={nb_users}, seed={seed}, one_phase={one_phase} due to error: {e}")
+                results[one_phase]["avgs"][seed].append(np.nan)
+                results[one_phase]["lowers"][seed].append(np.nan)
+                results[one_phase]["uppers"][seed].append(np.nan)
 
 x = np.array(list(user_range))
 bar_width = 0.18
@@ -197,44 +207,62 @@ offsets = np.linspace(-bar_width*1.5, bar_width*1.5, len(seeds))
 plt.figure(figsize=(12,6))
 colors = plt.cm.tab10.colors
 
+# Plot one_phase=False bars first (behind)
 for i, seed in enumerate(seeds):
-    y = np.array(decoded_avgs_per_seed[seed])
-    yerr_lower = y - np.array(decoded_lowers_per_seed[seed])
-    yerr_upper = np.array(decoded_uppers_per_seed[seed]) - y
-    yerr = np.vstack([yerr_lower, yerr_upper])
-    plt.bar(x + offsets[i], y, width=bar_width, yerr=[yerr_lower, yerr_upper], 
-            align='center', alpha=0.7, ecolor='black', capsize=4, 
-            label=f"Seed {seed}", color=colors[i % len(colors)])
+    y = np.array(results[False]["avgs"][seed])
+    yerr_lower = y - np.array(results[False]["lowers"][seed])
+    yerr_upper = np.array(results[False]["uppers"][seed]) - y
+    plt.bar(
+        x + offsets[i], y, width=bar_width*1.15,  # slightly longer bars
+        yerr=[yerr_lower, yerr_upper],
+        align='center', alpha=0.4, ecolor='black', capsize=4,
+        label=f"Seed {seed} (two-phase)", color=colors[i % len(colors)], zorder=1
+    )
+
+# Plot one_phase=True bars in front
+for i, seed in enumerate(seeds):
+    y = np.array(results[True]["avgs"][seed])
+    yerr_lower = y - np.array(results[True]["lowers"][seed])
+    yerr_upper = np.array(results[True]["uppers"][seed]) - y
+    plt.bar(
+        x + offsets[i], y, width=bar_width,
+        yerr=[yerr_lower, yerr_upper],
+        align='center', alpha=0.8, ecolor='black', capsize=4,
+        label=f"Seed {seed} (one-phase)", color=colors[i % len(colors)], zorder=2, edgecolor='k'
+    )
 
 plt.xlabel("Number of Users")
 plt.ylabel("Mean Decoded")
-plt.title("Mean Decoded Users vs Number of Users (per seed, with CI)")
+plt.title("Mean Decoded Users vs Number of Users (per seed, with CI)\n(one-phase in front, two-phase behind)")
 plt.xticks(x)
 plt.grid(True, axis='y')
 plt.legend()
 plt.tight_layout()
+plt.ylim(10,12)
 plt.show()
+
+
 
 
 
 #%%
 
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 
-# epoch_centers = epoch_centers[-100:]
-# means = means[-100:]
-# cis_lower = cis_lower[-100:]
-# cis_upper = cis_upper[-100:]
+# # epoch_centers = epoch_centers[-100:]
+# # means = means[-100:]
+# # cis_lower = cis_lower[-100:]
+# # cis_upper = cis_upper[-100:]
 
-plt.figure(figsize=(8,4))
-plt.plot(epoch_centers, means, '-', label=f"{LABEL}")
-plt.fill_between(epoch_centers, cis_lower, cis_upper, color='C0', alpha=0.3, label="Confidence Interval")
-plt.xlabel("Epoch")
-plt.ylabel(LABEL)
-plt.title(f"{LABEL} with Confidence Interval")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-plt.show()
+# plt.figure(figsize=(8,4))
+# plt.plot(epoch_centers, means, '-', label=f"{LABEL}")
+# plt.fill_between(epoch_centers, cis_lower, cis_upper, color='C0', alpha=0.3, label="Confidence Interval")
+# plt.xlabel("Epoch")
+# plt.ylabel(LABEL)
+# plt.title(f"{LABEL} with Confidence Interval")
+# plt.legend()
+# plt.grid(True)
+# plt.tight_layout()
+# plt.show()
 
 
