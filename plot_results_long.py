@@ -53,16 +53,6 @@ def smooth_sma_nan(x, k=51):
     return y
 
 
-#%%
-
-#print(os.listdir("res-long"))
-
-dir_name = "res-long/res-1p-u10-s10-e1000-b1000-s1"
-dir_name = "res-long/res-u10-s5-e1000-b1000-s1"
-dir_name = "res-long/res-load-1p-u20-s20-e1000-b1000-s1"
-#dir_name = "res-long/res-load-u20-s10-e1000-b1000-s1"
-log_file_name = find_jsonl_file(dir_name)
-all_data = load_jsonl(log_file_name)
 
 #%%
 
@@ -128,30 +118,102 @@ def compute_array_stats(
 
     return epoch_centers, means, cis_lower, cis_upper
 
-K = 250  # Set the window size for statistics
-ARRAY_KEY = "decoded_array"  # Change this to the desired key if needed
-LABEL = "Mean"  # Change this to a more descriptive label if needed
 
-epoch_centers, means, cis_lower, cis_upper = compute_array_stats(
-    all_data, K=K, confidence=CONFIDENCE, array_key=ARRAY_KEY, label=LABEL
-)
+
 
 
 #%%
 
-dir_name = "res-long/res-load-1p-u20-s20-e1000-b1000-s1"
-#dir_name = "res-1p-u10-s10-e10000-b1000-seed200"
-dir_name = "res-long/res-load-u20-s10-e1000-b1000-s1"
-log_file_name = find_jsonl_file(dir_name)
-all_data = load_jsonl(log_file_name)
+# #print(os.listdir("res-long"))
 
-K = 250  # Set the window size for statistics
-ARRAY_KEY = "decoded_array"  # Change this to the desired key if needed
-LABEL = "Mean"  # Change this to a more descriptive label if needed
+# dir_name = "res-long/res-1p-u10-s10-e1000-b1000-s1"
+# dir_name = "res-long/res-u10-s5-e1000-b1000-s1"
+# #dir_name = "res-long/res-load-1p-u20-s20-e1000-b1000-s1"
+# #dir_name = "res-long/res-load-u20-s10-e1000-b1000-s1"
+# log_file_name = find_jsonl_file(dir_name)
+# # all_data = load_jsonl(log_file_name)
 
-epoch_centers, means, cis_lower, cis_upper = compute_array_stats(
-    all_data, K=K, confidence=CONFIDENCE, array_key=ARRAY_KEY, label=LABEL
-)
+# K = 250  # Set the window size for statistics
+# ARRAY_KEY = "decoded_array"  # Change this to the desired key if needed
+# LABEL = "Mean"  # Change this to a more descriptive label if needed
+
+# epoch_centers, means, cis_lower, cis_upper = compute_array_stats(
+#     all_data, K=K, confidence=CONFIDENCE, array_key=ARRAY_KEY, label=LABEL
+# )
+
+
+#%%
+
+
+def get_load_data(nb_users, nb_slots=20, one_phase=False, seed=1):
+    if one_phase:
+        dir_name = f"res-long/res-load-1p-u{nb_users}-s{nb_slots}-e1000-b1000-s{seed}"
+    else:
+        dir_name = f"res-long/res-load-u{nb_users}-s{nb_slots//2}-e1000-b1000-s{seed}"
+    log_file_name = find_jsonl_file(dir_name)
+    all_data = load_jsonl(log_file_name)
+
+    NB_PARTS = 4 # we take statistics on the last 1/NB_PARTS
+
+    K = int(len(all_data)//NB_PARTS)
+    assert (len(all_data) % K) == 0
+    #K = 250  # Set the window size for statistics
+    ARRAY_KEY = "decoded_array"  # Change this to the desired key if needed
+    LABEL = "Mean"  # Change this to a more descriptive label if needed
+
+    epoch_centers, means, cis_lower, cis_upper = compute_array_stats(
+        all_data, K=K, confidence=CONFIDENCE, array_key=ARRAY_KEY, label=LABEL
+    )
+    return epoch_centers[-1], means[-1], cis_lower[-1], cis_upper[-1]
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+user_range = range(2, 31)  # Users from 2 to 30
+seeds = range(1, 5)        # Seeds 1 to 4
+
+# Store results per seed
+decoded_avgs_per_seed = {seed: [] for seed in seeds}
+decoded_lowers_per_seed = {seed: [] for seed in seeds}
+decoded_uppers_per_seed = {seed: [] for seed in seeds}
+
+for nb_users in user_range:
+    for seed in seeds:
+        try:
+            _, avg, lower, upper = get_load_data(nb_users, seed=seed, one_phase=True)
+            decoded_avgs_per_seed[seed].append(avg)
+            decoded_lowers_per_seed[seed].append(lower)
+            decoded_uppers_per_seed[seed].append(upper)
+        except Exception as e:
+            print(f"Skipping users={nb_users}, seed={seed} due to error: {e}")
+            decoded_avgs_per_seed[seed].append(np.nan)
+            decoded_lowers_per_seed[seed].append(np.nan)
+            decoded_uppers_per_seed[seed].append(np.nan)
+
+x = np.array(list(user_range))
+bar_width = 0.18
+offsets = np.linspace(-bar_width*1.5, bar_width*1.5, len(seeds))
+
+plt.figure(figsize=(12,6))
+colors = plt.cm.tab10.colors
+
+for i, seed in enumerate(seeds):
+    y = np.array(decoded_avgs_per_seed[seed])
+    yerr_lower = y - np.array(decoded_lowers_per_seed[seed])
+    yerr_upper = np.array(decoded_uppers_per_seed[seed]) - y
+    yerr = np.vstack([yerr_lower, yerr_upper])
+    plt.bar(x + offsets[i], y, width=bar_width, yerr=[yerr_lower, yerr_upper], 
+            align='center', alpha=0.7, ecolor='black', capsize=4, 
+            label=f"Seed {seed}", color=colors[i % len(colors)])
+
+plt.xlabel("Number of Users")
+plt.ylabel("Mean Decoded")
+plt.title("Mean Decoded Users vs Number of Users (per seed, with CI)")
+plt.xticks(x)
+plt.grid(True, axis='y')
+plt.legend()
+plt.tight_layout()
+plt.show()
 
 
 
