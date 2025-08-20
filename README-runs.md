@@ -24,6 +24,13 @@
 
 ------
 
+python train_irsa_estimator.py --resume --zero-reg --warmup-cosine --lr 2e-5 --epochs 40
+python train_irsa_estimator.py --resume --warmup-cosine --zero-reg --lr 2e-5 --epochs 40
+python train_irsa_estimator.py --resume --warmup-cosine --lr 5e-5 --epochs 200 --swa --swa-start-frac 0.7
+
+
+python irsa_two_phases.py  --one-phase --seed 200 --users 10  --slots 10   --epochs 10000   --batch-size 1000   --log-action  --torch-single-core
+
 * 
 python train_irsa_estimator.py --resume --resume --warmup-cosine --lr 5e-5 --epochs 60
 
@@ -38,4 +45,7 @@ or --swa --swa-start-epoch 80
 --eval-symmetrize 16 --symm-slots
 --eval-symmetrize 16 --symm-users
 --eval-symmetrize 16 --symm-users --symm-slots
+
+-----
+
 
