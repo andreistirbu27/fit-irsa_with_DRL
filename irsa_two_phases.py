@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument('--learning-rate', type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument('--compress', action='store_true', help='Compress log file with gzip')
     parser.add_argument('--log', action='store_true')
+    parser.add_argument('--poisson', action='store_true')
     parser.add_argument('--log-action', action='store_true', help='Log all actions of all users in each sample of the batch (r1 and r2); implies --log')
     parser.add_argument('--prefix', type=str, default="")
     parser.add_argument('--epoch-save-interval', type=int, default=200, help='Save model every N epochs')
@@ -46,6 +47,7 @@ def parse_args():
     parser.add_argument('--epoch-half-lr-interval', type=int, default=None, help='If set, halve learning rate every N epochs')
     parser.add_argument('--one-phase', action='store_true', help='Run only Round 1 (Round 2 disabled; equivalent to 0 slots in phase 2)')
     parser.add_argument('--energy-feedback', action='store_true', help='Use scalar energy feedback per-slot occupancy counts replace the undecoded one-hot.')
+    parser.add_argument('--transmission-cost', type=float, default=None)
 
     args = parser.parse_args()
     # --log-action implies --log
@@ -70,6 +72,8 @@ def make_result_dir(cfg):
             f"{base}-u{cfg['num_users']}",
             f"s{cfg['num_slots']}"
         ]
+        if cfg['poisson']:
+            parts.append("poi")
         if cfg['hidden_dim'] != DEFAULT_HIDDEN_DIM:
             parts.append(f"h{cfg['hidden_dim']}")
         if cfg['epochs'] != DEFAULT_EPOCHS:
@@ -284,6 +288,7 @@ def sic_decode(actions, total_slots):
 def round1_actions(policy, obs_all, num_users, input_dim, feedback_dim, prev_action_dim, device):
     actions_r1, acts_bin_r1, entropy_r1 = [], [], []
     lp_r1_total = 0.0
+    num_slots = prev_action_dim  # num_slots is equal to prev_action_dim
     for u in range(num_users):
         x1 = torch.cat([
             obs_all[u],
@@ -300,9 +305,10 @@ def round1_actions(policy, obs_all, num_users, input_dim, feedback_dim, prev_act
     acts_bin_r1 = torch.stack(acts_bin_r1, dim=0)  # [num_users, num_slots]
     return actions_r1, acts_bin_r1, entropy_r1, lp_r1_total
 
-def round2_actions(policy, obs_all, acts_bin_r1, fb_vec, num_users, input_dim, device):
+def round2_actions(policy, obs_all, acts_bin_r1, fb_vec, num_users,  input_dim, device):
     actions_r2, acts_bin_r2, entropy_r2 = [], [], []
-    lp_r2_total = 0.0
+    lp_r2_total = 0.0  
+    num_slots = acts_bin_r1.shape[1]  # Fix: get number of slots from acts_bin_r1
     for u in range(num_users):
         prev_act_u = acts_bin_r1[u].float()  # THIS user's R1 action (0/1 per slot)
         x2 = torch.cat([
@@ -312,7 +318,7 @@ def round2_actions(policy, obs_all, acts_bin_r1, fb_vec, num_users, input_dim, d
         ], dim=0)
         assert x2.numel() == input_dim
         logits_u = policy(x2)
-        cw_u, lp_u, a_u, e_u = sample_actions_user(logits_u)
+        cw_u, lp_u, a_u, e_u = sample_actions_user(logits_u)       
         actions_r2.append(cw_u)
         acts_bin_r2.append(a_u)
         entropy_r2.append(e_u)
@@ -328,12 +334,13 @@ def compute_reinforce_loss(batch_rewards, batch_log_probs, optimizer):
     optimizer.step()
     return baseline
 
-def log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_actions_r1, batch_actions_r2, log_action, log_file, timing_info=None):
-    all_entropy_r1 = torch.stack(batch_entropy_r1)
-    all_entropy_r2 = torch.stack(batch_entropy_r2)
+def log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_actions_r1, batch_actions_r2, batch_num_users, log_action, log_file, timing_info=None):
+    all_entropy_r1 = torch.cat(batch_entropy_r1)
+    all_entropy_r2 = torch.cat(batch_entropy_r2)
     rec = {
         "epoch": epoch, 
         "decoded_array": batch_uniques, 
+        "num_users": batch_num_users,
         "entropy_r1_mean": all_entropy_r1.mean().item(),
         "entropy_r2_mean": all_entropy_r2.mean().item(),
         "entropy_r1_std_dev": all_entropy_r1.std().item(),
@@ -357,6 +364,9 @@ def log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_ac
     unique_r2, counts_r2 = np.unique(nb_slots2, return_counts=True)
     histogram_r2 = dict(zip([int(u) for u in unique_r2], [int(c) for c in counts_r2]))
     rec["r2_slots_histogram"] = histogram_r2
+
+    rec["num_users_mean"] = float(np.mean(batch_num_users))
+    rec["num_users_std"]  = float(np.std(batch_num_users))
 
     if log_action:
         rec["actions_r1"] = batch_actions_r1
@@ -414,12 +424,14 @@ def train(policy, optimizer, cfg,
 
     log_action = cfg.get('log_action', False)
     one_phase = cfg.get('one_phase', False)
+    transmission_cost = cfg["transmission_cost"]
 
     # Learning rate halving support
     epoch_half_lr_interval = cfg.get('epoch_half_lr_interval', None)
     if epoch_half_lr_interval is not None and epoch_half_lr_interval <= 0:
         epoch_half_lr_interval = None  # ignore non-positive values
 
+    original_num_users = num_users
     for epoch in tqdm(range(epochs), desc="Training", unit="epoch"):
         epoch_start_time = time.time()
 
@@ -439,6 +451,7 @@ def train(policy, optimizer, cfg,
             lam_r2 = sparsity_r2_max * min(1.0, (epoch - warmup_r1) / float(denom))
 
         batch_rewards, batch_log_probs, batch_uniques = [], [], []
+        batch_num_users = []
         batch_frac_decR1_txR2 = []
         last_r1_act, last_r2_act = 0.0, 0.0
         batch_entropy_r1 = []
@@ -451,13 +464,34 @@ def train(policy, optimizer, cfg,
         # --- Timing: batch episodes generation ---
         batch_gen_start = time.time()
 
+
         for _ in range(batch_size):
+
+            num_users = original_num_users
+            # If using Poisson arrivals, sample the actual number of users for this batch
+            if cfg.get('poisson', False):
+                # The mean is num_users, sample from Poisson and ensure at least 1 user
+                # Redraw Poisson until > 0 (no bias), warn if >10, error if >1000
+                loop_count = 0
+                while True:
+                    actual_num_users = np.random.poisson(original_num_users)
+                    loop_count += 1
+                    if actual_num_users > 0:
+                        break
+                    if loop_count > 1000:
+                        raise RuntimeError("Poisson sampling for actual_num_users exceeded 1000 attempts (Pr(0) too high?)")
+                    if loop_count > 10 and loop_count % 10 == 0:
+                        print(f"Warning: Poisson sampling for actual_num_users took {loop_count} attempts (Pr(0) may be high)", file=sys.stderr)
+                num_users = actual_num_users
+                actual_num_users = None
+
+
             # per-user noise (keep or share, your call)
-            obs_all = [torch.rand(input_obs_dim, device=device) for _ in range(num_users)]
+            obs_all = [torch.rand(input_obs_dim, device=device) for _ in range(num_users)]                
 
             # -------- Round 1: per-user policy (feedback=0, prev_action=zeros) --------
             actions_r1, acts_bin_r1, entropy_r1, lp_r1_total = round1_actions(
-                policy, obs_all, num_users, input_dim, feedback_dim, prev_action_dim, device
+                policy, obs_all, num_users,  input_dim, feedback_dim, prev_action_dim, device
             )
 
             # feedback from Round 1
@@ -469,7 +503,7 @@ def train(policy, optimizer, cfg,
                     energy_per_slot=energy_per_slot,
                     use_energy=cfg.get('energy_feedback', False)).to(device)  # len = 3*num_slots
                 actions_r2, acts_bin_r2, entropy_r2, lp_r2_total = round2_actions(
-                    policy, obs_all, acts_bin_r1, fb_vec, num_users, input_dim, device
+                    policy, obs_all, acts_bin_r1, fb_vec, num_users,  input_dim, device
                 )
             else:
                 # Phase 2 disabled: no transmissions in R2
@@ -497,18 +531,21 @@ def train(policy, optimizer, cfg,
             total_slots_concat = num_slots if one_phase else (2 * num_slots)
             decoded_concat = sic_decode(actions_concat, total_slots=total_slots_concat)
             num_decoded_concat = len(decoded_concat)
-            reward = num_decoded_concat / num_users
+            reward = num_decoded_concat / max(num_users,1)
 
             # -------------- Ramped sparsity in BOTH rounds  --------------
             r1_activity = acts_bin_r1.float().mean().item()
             r2_activity = acts_bin_r2.float().mean().item() if not one_phase else 0.0
-            reward -= lam_r1 * r1_activity
-            reward -= lam_r2 * r2_activity
+            if transmission_cost is None:
+                reward -= lam_r1 * r1_activity
+                reward -= lam_r2 * r2_activity
+            else:
+                reward -= transmission_cost*(r1_activity+r2_activity)*num_slots
             last_r1_act, last_r2_act = r1_activity, r2_activity
 
             # -------- Metric: frac(R1-decoded who transmit in R2) --------
             if (len(decoded_r1) > 0) and (not one_phase):
-                mask_dec = torch.zeros(num_users, dtype=torch.bool)
+                mask_dec = torch.zeros(num_users, dtype=torch.bool, device=acts_bin_r2.device)
                 mask_dec[list(decoded_r1)] = True
                 r2_any = (acts_bin_r2.sum(dim=1) > 0)  # per-user bool
                 frac_decR1_txR2 = r2_any[mask_dec].float().mean().item()
@@ -517,6 +554,7 @@ def train(policy, optimizer, cfg,
 
             # accumulate
             batch_rewards.append(reward)
+            batch_num_users.append(num_users)
             batch_log_probs.append(lp_r1_total + lp_r2_total)
             batch_uniques.append(num_decoded_concat)
             batch_frac_decR1_txR2.append(frac_decR1_txR2)
@@ -554,7 +592,7 @@ def train(policy, optimizer, cfg,
                 "batch_generation_sec": batch_gen_duration,
                 "train_phase_sec": train_phase_duration
             }
-            log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_actions_r1, batch_actions_r2, log_action, log_file, timing_info=timing_info)
+            log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_actions_r1, batch_actions_r2, batch_num_users, log_action, log_file, timing_info=timing_info)
 
         # after logging/printing per-epoch stats
         if cfg.get('epoch_save_interval') and (epoch + 1) % cfg['epoch_save_interval'] == 0:
@@ -564,7 +602,7 @@ def train(policy, optimizer, cfg,
         if epoch % 100 == 0:
             print(f"Epoch {epoch}: "
                   f"Avg Reward={baseline:.3f}, "
-                  f"Avg decoded (concat)={avg_unique_history[-1]:.2f}/{num_users}, "
+                  f"Avg decoded (concat)={avg_unique_history[-1]:.2f}/~{np.mean(batch_num_users):.1f}, "
                   f"frac(R1-decoded tx in R2)={frac_decR1_txR2_hist[-1]:.3f}, "
                   f"R1 act={last_r1_act:.3f} (λ1={lam_r1:.4f}), "
                   f"R2 act={last_r2_act:.3f} (λ2={lam_r2:.4f}), "
@@ -627,10 +665,12 @@ def main():
         'keep_last_models': args.keep_last_models,
         'seed': args.seed,
         'prefix': args.prefix,
+        'poisson': args.poisson,
         'log_action': getattr(args, "log_action", False),
         'epoch_half_lr_interval': getattr(args, "epoch_half_lr_interval", None),
         'one_phase': getattr(args, 'one_phase', False),
         'energy_feedback': getattr(args, 'energy_feedback', False),
+        'transmission_cost': args.transmission_cost
     }
 
     # Derived dims
