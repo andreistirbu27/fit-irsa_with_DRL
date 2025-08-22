@@ -312,13 +312,7 @@ def train(policy, optimizer, cfg,
             # per-user noise (keep or share, your call)
             obs_all = [torch.rand(input_obs_dim) for _ in range(num_users)]
 
-            # If using Poisson arrivals, sample the actual number of users for this batch
-            if cfg.get('poisson', False):
-                # The mean is num_users, sample from Poisson and ensure at least 1 user
-                actual_num_users = np.random.poisson(num_users)
-                actual_num_users = max(1, actual_num_users)
-            else:
-                actual_num_users = num_users
+
 
             # -------- Round 1: per-user policy (feedback=0, prev_action=zeros) --------
             actions_r1, acts_bin_r1 = [], []
@@ -332,16 +326,7 @@ def train(policy, optimizer, cfg,
                 assert x1.numel() == input_dim
                 logits_u = policy(x1)  # [num_slots]
                 cw_u, lp_u, a_u = sample_actions_user(logits_u)  # a_u: [num_slots] in {0,1}
-                # For users above actual_num_users, blank their actions immediately after sampling
-                if u >= actual_num_users:
-                    cw_u = (0, [])
-                    lp_u = 0.0
-                    a_u = torch.zeros(num_slots, dtype=a_u.dtype)
-                actions_r1.append(cw_u)
-                acts_bin_r1.append(a_u)
-                lp_r1_total = lp_r1_total + lp_u
             acts_bin_r1 = torch.stack(acts_bin_r1, dim=0)  # [num_users, num_slots]
-
             # feedback from Round 1
             decoded_r1, fb_idx = run_sic_simulation(actions_r1, num_slots, return_feedback_indices=True)
 
@@ -359,11 +344,6 @@ def train(policy, optimizer, cfg,
                 assert x2.numel() == input_dim
                 logits_u = policy(x2)
                 cw_u, lp_u, a_u = sample_actions_user(logits_u)
-                # For users above actual_num_users, blank their actions immediately after sampling
-                if u >= actual_num_users:
-                    cw_u = (0, [])
-                    lp_u = 0.0
-                    a_u = torch.zeros(num_slots, dtype=a_u.dtype)
                 actions_r2.append(cw_u)
                 acts_bin_r2.append(a_u)
                 lp_r2_total = lp_r2_total + lp_u

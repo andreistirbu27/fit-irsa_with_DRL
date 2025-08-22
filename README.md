@@ -89,3 +89,39 @@ For open source projects, say how it is licensed.
 
 ## Project status
 If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+
+
+
+            # If using Poisson arrivals, sample the actual number of users for this batch
+            if cfg.get('poisson', False):
+                # The mean is num_users, sample from Poisson and ensure at least 1 user
+                actual_num_users = np.random.poisson(num_users)
+                actual_num_users = max(1, actual_num_users)
+            else:
+                actual_num_users = num_users
+
+
+            # -------- Round 1: per-user policy (feedback=0, prev_action=zeros) --------
+            actions_r1, acts_bin_r1 = [], []
+            lp_r1_total = 0.0
+            for u in range(num_users):
+                x1 = torch.cat([
+                    obs_all[u],
+                    torch.zeros(feedback_dim),  # no feedback yet
+                    torch.zeros(prev_action_dim)  # no previous action yet
+                ], dim=0)
+                assert x1.numel() == input_dim
+                logits_u = policy(x1)  # [num_slots]
+                cw_u, lp_u, a_u = sample_actions_user(logits_u)  # a_u: [num_slots] in {0,1}
+                # For users above actual_num_users, blank their actions immediately after sampling
+                if u >= actual_num_users:
+                    cw_u = (0, [])
+                    lp_u = 0.0
+                    a_u = torch.zeros(num_slots, dtype=a_u.dtype)
+                actions_r1.append(cw_u)
+                acts_bin_r1.append(a_u)
+                lp_r1_total = lp_r1_total + lp_u
+            acts_bin_r1 = torch.stack(acts_bin_r1, dim=0)  # [num_users, num_slots]
+
+            # feedback from Round 1
+            decoded_r1, fb_idx = run_sic_simulation(actions_r1, num_slots, return_feedback_indices=True)       
