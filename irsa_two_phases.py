@@ -326,9 +326,18 @@ def round2_actions(policy, obs_all, acts_bin_r1, fb_vec, num_users,  input_dim, 
     acts_bin_r2 = torch.stack(acts_bin_r2, dim=0)  # [num_users, num_slots]
     return actions_r2, acts_bin_r2, entropy_r2, lp_r2_total
 
-def compute_reinforce_loss(batch_rewards, batch_log_probs, optimizer):
+def old_compute_reinforce_loss(batch_rewards, batch_log_probs, optimizer): # it's ok, just not using torch everywhere
     baseline = np.mean(batch_rewards)
     total_loss = sum([-(r - baseline) * lp for r, lp in zip(batch_rewards, batch_log_probs)])
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+    return baseline
+
+def compute_reinforce_loss(batch_rewards, batch_log_probs, optimizer):
+    baseline = float(np.mean(batch_rewards))
+    terms = [-(r - baseline) * lp for r, lp in zip(batch_rewards, batch_log_probs)]
+    total_loss = torch.stack(terms).sum()
     optimizer.zero_grad()
     total_loss.backward()
     optimizer.step()
