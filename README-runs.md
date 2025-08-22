@@ -14,13 +14,24 @@
 ./run-var-load.sh 3 10 30
 ./run-var-load.sh 4 10 30
 
-
 ./run-var-load.sh --one-phase 1 20 30
 ./run-var-load.sh --one-phase 2 20 30
 ./run-var-load.sh --one-phase 3 20 30
 ./run-var-load.sh --one-phase 4 20 30
 
+------
 
+runs 22 aug 2025:
+
+./run-var-load.sh --one-phase 11 20 30
+./run-var-load.sh --one-phase --poisson 11 20 30
+./run-var-load.sh  11 20 30
+./run-var-load.sh --poisson 11 20 30
+
+./run-var-users.sh --one-phase 11
+./run-var-users.sh --one-phase --poisson 11
+./run-var-users.sh  11
+./run-var-user.sh --poisson 11 
 
 ------
 
