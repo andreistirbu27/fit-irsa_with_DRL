@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument('--learning-rate', type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument('--compress', action='store_true', help='Compress log file with gzip')
     parser.add_argument('--log', action='store_true')
+    parser.add_argument('--poisson', action='store_true')
     parser.add_argument('--prefix', type=str, default="")
     parser.add_argument('--epoch-save-interval', type=int, default=200, help='Save model every N epochs')
     parser.add_argument('--result-dir', type=str, default=None, help='Override result dir')
@@ -55,6 +56,8 @@ def make_result_dir(cfg):
             f"{base}-u{cfg['num_users']}",
             f"s{cfg['num_slots']}"
         ]
+        if cfg['poisson']:
+            parts.append("poi")
         if cfg['hidden_dim'] != DEFAULT_HIDDEN_DIM:
             parts.append(f"h{cfg['hidden_dim']}")
         if cfg['epochs'] != DEFAULT_EPOCHS:
@@ -301,12 +304,21 @@ def train(policy, optimizer, cfg,
             lam_r2 = sparsity_r2_max * min(1.0, (epoch - warmup_r1) / float(denom))
 
         batch_rewards, batch_log_probs, batch_uniques = [], [], []
+        batch_actual_num_users = []
         batch_frac_decR1_txR2 = []
         last_r1_act, last_r2_act = 0.0, 0.0
 
         for _ in range(batch_size):
             # per-user noise (keep or share, your call)
             obs_all = [torch.rand(input_obs_dim) for _ in range(num_users)]
+
+            # If using Poisson arrivals, sample the actual number of users for this batch
+            if cfg.get('poisson', False):
+                # The mean is num_users, sample from Poisson and ensure at least 1 user
+                actual_num_users = np.random.poisson(num_users)
+                actual_num_users = max(1, actual_num_users)
+            else:
+                actual_num_users = num_users
 
             # -------- Round 1: per-user policy (feedback=0, prev_action=zeros) --------
             actions_r1, acts_bin_r1 = [], []
@@ -320,6 +332,11 @@ def train(policy, optimizer, cfg,
                 assert x1.numel() == input_dim
                 logits_u = policy(x1)  # [num_slots]
                 cw_u, lp_u, a_u = sample_actions_user(logits_u)  # a_u: [num_slots] in {0,1}
+                # For users above actual_num_users, blank their actions immediately after sampling
+                if u >= actual_num_users:
+                    cw_u = (0, [])
+                    lp_u = 0.0
+                    a_u = torch.zeros(num_slots, dtype=a_u.dtype)
                 actions_r1.append(cw_u)
                 acts_bin_r1.append(a_u)
                 lp_r1_total = lp_r1_total + lp_u
@@ -342,6 +359,11 @@ def train(policy, optimizer, cfg,
                 assert x2.numel() == input_dim
                 logits_u = policy(x2)
                 cw_u, lp_u, a_u = sample_actions_user(logits_u)
+                # For users above actual_num_users, blank their actions immediately after sampling
+                if u >= actual_num_users:
+                    cw_u = (0, [])
+                    lp_u = 0.0
+                    a_u = torch.zeros(num_slots, dtype=a_u.dtype)
                 actions_r2.append(cw_u)
                 acts_bin_r2.append(a_u)
                 lp_r2_total = lp_r2_total + lp_u
@@ -379,6 +401,7 @@ def train(policy, optimizer, cfg,
 
             # accumulate
             batch_rewards.append(reward)
+            batch_actual_num_users.append(actual_num_users)
             batch_log_probs.append(lp_r1_total + lp_r2_total)
             batch_uniques.append(num_decoded_concat)
             batch_frac_decR1_txR2.append(frac_decR1_txR2)
@@ -449,7 +472,8 @@ def main():
         'result_dir': args.result_dir,
         'keep_last_models': args.keep_last_models,
         'seed': args.seed,
-        'prefix': args.prefix
+        'prefix': args.prefix,
+        'poisson': args.poisson
     }
 
     # Derived dims
