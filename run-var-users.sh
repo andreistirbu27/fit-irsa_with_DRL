@@ -30,11 +30,7 @@ fi
 
 tsp -S 64
 for users in $(seq 2 2 30); do
-    if (( ONE_PHASE )); then
-        slots=$(( 2*((users+1)/2) ))
-    else
-        slots=$(( (users+1)/2 ))
-    fi
+    slots=$(( (users+1)/2 ))
     args=(
         python irsa_two_phases.py
         --slots "$slots"
@@ -47,6 +43,7 @@ for users in $(seq 2 2 30); do
         --epoch-half-lr-interval 100
         --epoch-save-interval 100
         --keep-last-models 100
+        --transmission-cost 0        
     )
     if (( POISSON )); then
         args+=(--poisson)

@@ -43,6 +43,7 @@ for users in $(seq 1 "$max_users"); do
     --epoch-half-lr-interval 100
     --epoch-save-interval 100
     --keep-last-models 100
+    --transmission-cost 0
   )
   # Add the python flags only if requested
   if (( ONE_PHASE )); then
