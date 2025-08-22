@@ -82,6 +82,9 @@ def make_result_dir(cfg):
             parts.append(f"b{cfg['batch_size']}")
         if cfg['learning_rate'] != DEFAULT_LEARNING_RATE:
             parts.append(f"lr{cfg['learning_rate']}")
+        # Add transmission cost if not None
+        if cfg.get('transmission_cost', None) is not None:
+            parts.append(f"tc{cfg['transmission_cost']}")            
         # Only add seed if it is not the default
         if cfg.get('seed', DEFAULT_SEED) != DEFAULT_SEED:
             parts.append(f"seed{cfg['seed']}")
@@ -690,6 +693,7 @@ def main():
     # Make result dir
     result_dir = make_result_dir(cfg)
     cfg['result_dir'] = result_dir
+    print("directory:", result_dir)
 
     # Save config for reproducibility
     with open(os.path.join(result_dir, "config.json"), "w") as f:
