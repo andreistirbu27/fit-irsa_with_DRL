@@ -259,9 +259,68 @@ def plot_throughtput_vs_users_slots(prefix="-load", normalize=False, nb_slots=20
     plt.show()
 
 
+#%%
 
 plot_throughtput_vs_users_slots(normalize=False, prefix="-load", nb_slots=20, xlim=(3.5,30.5), ylim=(9.5,12), fig_file_name="throughput-vs-users-20slots.pdf")
 plot_throughtput_vs_users_slots(normalize=True, prefix="", nb_slots=None, ylim=(0.5,3/4), fig_file_name="throughput-vs-users-and-slots.pdf")
+
+
+#%%
+
+def get_load_data(nb_users, nb_slots=20, one_phase=False, seed=1, prefix="-load"):
+    if one_phase:
+        dir_name = f"res-long/res{prefix}-1p-u{nb_users}-s{nb_slots}-e1000-b1000-s{seed}"
+    else:
+        dir_name = f"res-long/res{prefix}-u{nb_users}-s{nb_slots//2}-e1000-b1000-s{seed}"
+    log_file_name = find_jsonl_file(dir_name)
+    all_data = load_jsonl(log_file_name)
+
+    NB_PARTS = 10 # we take statistics on the last 1/NB_PARTS
+
+    K = int(len(all_data)//NB_PARTS)
+    assert (len(all_data) % K) == 0
+    #K = 250  # Set the window size for statistics
+    ARRAY_KEY = "decoded_array"  # Change this to the desired key if needed
+    LABEL = "Mean"  # Change this to a more descriptive label if needed
+
+    epoch_centers, means, cis_lower, cis_upper = compute_array_stats(
+        all_data, K=K, confidence=CONFIDENCE, array_key=ARRAY_KEY, label=LABEL
+    )
+    return epoch_centers[-1], means[-1], cis_lower[-1], cis_upper[-1], all_data
+
+u1, u2, u3, u4, all_data = get_load_data(8,8, prefix="")
+entropy_r1 = [data["entropy_r1_mean"] for data in all_data]
+entropy_r1_std = [data["entropy_r1_std_dev"] for data in all_data]
+entropy_r2 = [data["entropy_r2_mean"] for data in all_data]
+entropy_r2_std = [data["entropy_r2_std_dev"] for data in all_data]
+
+epochs = list(range(len(all_data)))
+
+plt.figure(figsize=(8,4))
+plt.plot(epochs, entropy_r1, label="Entropy R1", color='C0')
+plt.fill_between(
+    epochs,
+    [m - s for m, s in zip(entropy_r1, entropy_r1_std)],
+    [m + s for m, s in zip(entropy_r1, entropy_r1_std)],
+    color='C0', alpha=0.3, label="R1 Mean ± Stddev"
+)
+plt.plot(epochs, entropy_r2, label="Entropy R2", color='C1')
+plt.fill_between(
+    epochs,
+    [m - s for m, s in zip(entropy_r2, entropy_r2_std)],
+    [m + s for m, s in zip(entropy_r2, entropy_r2_std)],
+    color='C1', alpha=0.3, label="R2 Mean ± Stddev"
+)
+plt.xlabel("Epoch")
+plt.ylabel("Entropy")
+plt.title("Entropy R1 and R2 with Mean ± Stddev")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+#get_load_data(20, nb_slots=20, one_phase=False, seed=1, prefix="-load")
+
 
 #%%
 
