@@ -1,5 +1,9 @@
 #!/bin/bash
-
+#---------------------------------------------------------------------------
+#SBATCH --job-name=varusers
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=30 # or any number
+#---------------------------------------------------------------------------
 # Use the first argument as seed if provided, else default to 1
 seed="${1:-1}"
 
@@ -53,3 +57,13 @@ for users in $(seq 2 2 30); do
     fi
     tsp "${args[@]}"
 done
+
+echo "# waiting for all tsp processes to finish"
+while tsp -w ; do
+    tsp -l | grep finished
+    tsp -C
+    sleep 1
+done
+
+tsp -l
+date

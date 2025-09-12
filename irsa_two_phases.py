@@ -399,9 +399,10 @@ def log_epoch(epoch, batch_entropy_r1, batch_entropy_r2, batch_uniques, batch_ac
     if timing_info is not None:
         rec.update(timing_info)
 
-    excluded_keys = ["decoded_array", "actions_r1", "actions_r2", "r1_slots_histogram", "r2_slots_histogram", "total_slots_histogram"]
+    excluded_keys = ["decoded_array", "num_users", "actions_r1", "actions_r2", "r1_slots_histogram", "r2_slots_histogram", "total_slots_histogram"]
     info = {k: v for k, v in rec.items() if k not in excluded_keys}
     info["decoded_mean"] = np.array(rec["decoded_array"]).mean()
+    info["nu_users_mean"] = np.array(rec["num_users"]).mean()
 
     # Format floats in info to 3 decimal digits
     def format_floats(d):

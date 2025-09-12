@@ -31,7 +31,31 @@ runs 22 aug 2025:
 ./run-var-users.sh --one-phase 11
 ./run-var-users.sh --one-phase --poisson 11
 ./run-var-users.sh  11
-./run-var-user.sh --poisson 11 
+./run-var-users.sh --poisson 11 
+
+./run-var-load.sh --one-phase 12 20 30
+./run-var-load.sh --one-phase --poisson 12 20 30
+./run-var-load.sh  12 20 30
+./run-var-load.sh --poisson 12 20 30
+
+./run-var-users.sh --one-phase 12
+./run-var-users.sh --one-phase --poisson 12
+./run-var-users.sh  12
+./run-var-users.sh --poisson 112
+
+S=21
+S=22
+sbatch --job-name upoi1p$S --export=ALL,POISSON=1,ONE_PHASE=1,SEED=$S varusers_array.sbatch
+sbatch --job-name upoi2p$S --export=ALL,POISSON=1,ONE_PHASE=0,SEED=$S varusers_array.sbatch
+sbatch --job-name u1p$S --export=ALL,POISSON=0,ONE_PHASE=1,SEED=$S varusers_array.sbatch
+sbatch --job-name u2p$S --export=ALL,POISSON=0,ONE_PHASE=0,SEED=$S varusers_array.sbatch
+
+S=21
+S=22
+sbatch --job-name=lpoi1p${S}  --array=2-30:2  --export=ALL,POISSON=1,ONE_PHASE=1,SEED=$S,SLOTS=20,PREFIX=load varload_array.sbatch
+sbatch --job-name=lpoi2p${S}  --array=2-30:2  --export=ALL,POISSON=1,ONE_PHASE=0,SEED=$S,SLOTS=10,PREFIX=load varload_array.sbatch
+sbatch --job-name=l1p${S}     --array=2-30:2  --export=ALL,POISSON=0,ONE_PHASE=1,SEED=$S,SLOTS=20,PREFIX=load varload_array.sbatch
+sbatch --job-name=l2p${S}     --array=2-30:2  --export=ALL,POISSON=0,ONE_PHASE=0,SEED=$S,SLOTS=10,PREFIX=load varload_array.sbatch
 
 ------
 

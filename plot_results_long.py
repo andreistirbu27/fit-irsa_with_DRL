@@ -209,6 +209,8 @@ def plot_throughtput_vs_users_slots(prefix="-load", normalize=False, nb_slots=20
                     results[one_phase]["lowers"][seed].append(np.nan)
                     results[one_phase]["uppers"][seed].append(np.nan)
 
+    print(results)
+
     x = np.array(list(user_range))
     bar_width = 0.18
     offsets = np.linspace(-bar_width*1.5, bar_width*1.5, len(seeds))
