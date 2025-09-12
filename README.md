@@ -125,3 +125,27 @@ If you have run out of energy or time for your project, put a note at the top of
 
             # feedback from Round 1
             decoded_r1, fb_idx = run_sic_simulation(actions_r1, num_slots, return_feedback_indices=True)       
+
+
+                        fb_vec = feedback_indices_to_vector(fb_idx, num_slots)  # len = 3*num_slots
+            actions_r2, acts_bin_r2 = [], []
+            lp_r2_total = 0.0
+            for u in range(num_users):
+                prev_act_u = acts_bin_r1[u].float()  # THIS user's R1 action (0/1 per slot)
+                x2 = torch.cat([
+                    obs_all[u],
+                    fb_vec,
+                    prev_act_u
+                ], dim=0)
+                assert x2.numel() == input_dim
+                logits_u = policy(x2)
+                cw_u, lp_u, a_u = sample_actions_user(logits_u)
+                # For users above actual_num_users, blank their actions immediately after sampling
+                if u >= actual_num_users:
+                    cw_u = (0, [])
+                    lp_u = 0.0
+                    a_u = torch.zeros(num_slots, dtype=a_u.dtype)
+                actions_r2.append(cw_u)
+                acts_bin_r2.append(a_u)
+                lp_r2_total = lp_r2_total + lp_u
+            acts_bin_r2 = torch.stack(acts_bin_r2, dim=0)  # [num_users, num_slots]
