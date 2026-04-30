@@ -56,7 +56,7 @@ def smooth_sma_nan(x, k=51):
 
 #%%
 
-# Plot decoded_mean and 95% confidence interval as a colored area
+# Plot decoded_mean and 99% confidence interval as a colored area
 
 
 CONFIDENCE = 0.99
@@ -169,7 +169,7 @@ def get_load_data(nb_users, nb_slots=20, one_phase=False, seed=1, prefix="-load"
 import numpy as np
 import matplotlib.pyplot as plt
 
-def plot_throughtput_vs_users_slots(prefix="-load", normalize=False, nb_slots=20, ylim=None, fig_file_name=None):
+def plot_throughtput_vs_users_slots(prefix="-load", normalize=False, nb_slots=20, xlim = None, ylim=None, fig_file_name=None):
     if nb_slots is not None:
         user_range = range(2, 31)  # Users from 2 to 30
     else:
@@ -225,7 +225,7 @@ def plot_throughtput_vs_users_slots(prefix="-load", normalize=False, nb_slots=20
             x + offsets[i], y, width=bar_width*1.15,  # slightly longer bars
             yerr=[yerr_lower, yerr_upper],
             align='center', alpha=0.4, ecolor='black', capsize=4,
-            label=f"Seed {seed} (two-phase)", color=colors[i % len(colors)], zorder=1
+            label=f"Seed {seed}, 2 Phases", color=colors[i % len(colors)], zorder=1
         )
 
     # Plot one_phase=True bars in front
@@ -237,12 +237,12 @@ def plot_throughtput_vs_users_slots(prefix="-load", normalize=False, nb_slots=20
             x + offsets[i], y, width=bar_width,
             yerr=[yerr_lower, yerr_upper],
             align='center', alpha=0.8, ecolor='black', capsize=4,
-            label=f"Seed {seed} (one-phase)", color=colors[i % len(colors)], zorder=2, edgecolor='k'
+            label=f"Seed {seed}, 1 Phase", color=colors[i % len(colors)], zorder=2, edgecolor='k'
         )
 
     plt.xlabel("Number of Users")
-    plt.ylabel("Mean Decoded")
-    plt.title("Mean Decoded Users vs Number of Users (per seed, with CI)\n(one-phase in front, two-phase behind)")
+    plt.ylabel("Mean Throughput")
+    plt.title("")
     plt.xticks(x)
     plt.grid(True, axis='y')
     plt.legend()
@@ -250,14 +250,16 @@ def plot_throughtput_vs_users_slots(prefix="-load", normalize=False, nb_slots=20
     if ylim is not None:
         plt.ylim(*ylim)
         #plt.ylim(10,12)
+    if xlim is not None:
+        plt.xlim(*xlim)
     if fig_file_name is not None:
         plt.savefig("throughput-vs-users-20slots.pdf")
     plt.show()
 
 
 
-plot_throughtput_vs_users_slots(normalize=False, prefix="-load", nb_slots=20, ylim=(10,12), fig_file_name="throughput-vs-users-20slots.pdf")
-plot_throughtput_vs_users_slots(normalize=True, prefix="", nb_slots=None, ylim=None, fig_file_name="throughput-vs-users-and-slots.pdf")
+plot_throughtput_vs_users_slots(normalize=False, prefix="-load", nb_slots=20, xlim = (10.5, 31), ylim=(10,12.5), fig_file_name="throughput-vs-users-20slots.pdf")
+plot_throughtput_vs_users_slots(normalize=True, prefix="", nb_slots=None, xlim = None, ylim=(0.40, 0.75), fig_file_name="throughput-vs-users-and-slots.pdf")
 
 #%%
 
