@@ -1,0 +1,8 @@
+"""Common result-directory conventions."""
+import os
+
+RESULTS_ROOT = "results"
+
+
+def under_results(name):
+    return os.path.join(RESULTS_ROOT, name)
