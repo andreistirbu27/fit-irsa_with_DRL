@@ -1,6 +1,13 @@
 #%%
 
-import irsa_two_phases
+import os
+import sys
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from src.train import irsa_two_phases
 
 # Load model using function from irsa_2phases
 
@@ -33,7 +40,7 @@ def prepare_forward_args(cfg, obs, feedback, prev_action):
     return x
 
 
-result_dir = "result-u4-s2"  # Change as needed
+result_dir = "results/result-u4-s2"  # Change as needed
 
 
 # Use the function from irsa_2phases to load the latest model
