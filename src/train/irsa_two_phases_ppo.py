@@ -1,19 +1,27 @@
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import argparse
-import os
-import json
-import sys
 from tqdm import tqdm
-import shutil
-import glob
 
-try:
-    import gzip
-except ImportError:
-    gzip = None
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from src.irsa_common.io import get_log_file, save_model, cleanup_old_models
+from src.irsa_common.results import under_results
+from src.irsa_common.seed import set_seed, set_torch_single_core
+from src.irsa_common.sic import (
+    feedback_indices_to_vector,
+    run_sic_simulation,
+    sample_actions_user,
+    sic_decode,
+)
 
 # =========================
 # Defaults / Hyperparameters
@@ -96,50 +104,9 @@ def make_result_dir(cfg):
         if cfg.get('seed', DEFAULT_SEED) != DEFAULT_SEED:
             parts.append(f"s{cfg['seed']}")
         result_dir = "-".join(parts)
+        result_dir = under_results(result_dir)
     os.makedirs(result_dir, exist_ok=True)
     return result_dir
-
-
-def get_log_file(result_dir, compress):
-    log_path = os.path.join(result_dir, "train_log.jsonl" + (".gz" if compress else ""))
-    if compress:
-        if gzip is None:
-            raise RuntimeError("gzip module not available for compression")
-        f = gzip.open(log_path, "at")
-    else:
-        f = open(log_path, "a")
-    return f, log_path
-
-
-def save_model(model, result_dir, epoch=None):
-    if epoch is None:
-        fname = os.path.join(result_dir, "policy_final.pt")
-    else:
-        fname = os.path.join(result_dir, f"policy_epoch{epoch}.pt")
-    torch.save(model.state_dict(), fname)
-
-
-def cleanup_old_models(result_dir, keep_last=DEFAULT_KEEP_LAST_MODELS):
-    pattern = os.path.join(result_dir, "policy_epoch*.pt")
-    files = glob.glob(pattern)
-
-    def extract_epoch(f):
-        base = os.path.basename(f)
-        try:
-            num = int(base.replace("policy_epoch", "").replace(".pt", ""))
-            return num
-        except Exception:
-            return -1
-
-    files_epochs = [(f, extract_epoch(f)) for f in files]
-    files_epochs = sorted([fe for fe in files_epochs if fe[1] >= 0], key=lambda x: x[1])
-    if keep_last > 0 and len(files_epochs) > keep_last:
-        to_delete = [f for f, _ in files_epochs[:-keep_last]]
-        for f in to_delete:
-            try:
-                os.remove(f)
-            except Exception as e:
-                print(f"Warning: could not remove old model {f}: {e}", file=sys.stderr)
 
 
 # =========================
@@ -222,18 +189,8 @@ class ActorCriticUser(nn.Module):
 
 
 # =========================
-# Distributions / sampling
+# PPO-specific log-prob / entropy helpers (sample_actions_user lives in irsa_common.sic)
 # =========================
-def sample_actions_user(logits_user):
-    """Sample Multi-Bernoulli (independent per-slot). Returns:
-       (r, [slots]), logprob_sum (scalar), action_bin (num_slots,) in {0,1}."""
-    d = torch.distributions.Bernoulli(logits=logits_user)
-    a = d.sample()
-    lp = d.log_prob(a).sum()
-    slots = torch.where(a == 1)[0].tolist()
-    return (len(slots), slots), lp, a
-
-
 def logprob_multibernoulli(logits_user, action_bin):
     d = torch.distributions.Bernoulli(logits=logits_user)
     return d.log_prob(action_bin).sum(dim=-1)
@@ -242,73 +199,6 @@ def logprob_multibernoulli(logits_user, action_bin):
 def entropy_multibernoulli(logits_user):
     d = torch.distributions.Bernoulli(logits=logits_user)
     return d.entropy().sum(dim=-1)
-
-
-# =========================
-# SIC + feedback
-# =========================
-def run_sic_simulation(actions, num_slots, return_feedback_indices=False):
-    slots_init = [[] for _ in range(num_slots)]
-    for user_id, (r, slot_list) in enumerate(actions):
-        for s in slot_list[:r]:
-            slots_init[s].append(user_id)
-    initial_empty = {i for i in range(num_slots) if len(slots_init[i]) == 0}
-
-    slots = [lst.copy() for lst in slots_init]
-    decoded_users = set()
-    progress = True
-    while progress:
-        progress = False
-        for s in range(num_slots):
-            if len(slots[s]) == 1:
-                u = slots[s][0]
-                if u not in decoded_users:
-                    decoded_users.add(u)
-                    for t in range(num_slots):
-                        if u in slots[t]:
-                            slots[t].remove(u)
-                    progress = True
-
-    if return_feedback_indices:
-        final_empty = {i for i in range(num_slots) if len(slots[i]) == 0}
-        decoded_idx = sorted(list(final_empty - initial_empty))
-        empty_idx = sorted(list(initial_empty))
-        undec_idx = sorted([i for i in range(num_slots)
-                            if len(slots_init[i]) > 0 and len(slots[i]) > 0])
-        return decoded_users, [decoded_idx, empty_idx, undec_idx]
-    return decoded_users
-
-
-def feedback_indices_to_vector(feedback_indices, num_slots):
-    decoded_idx, empty_idx, undec_idx = feedback_indices
-    d = torch.zeros(num_slots)
-    e = torch.zeros(num_slots)
-    u = torch.zeros(num_slots)
-    if decoded_idx: d[decoded_idx] = 1
-    if empty_idx:   e[empty_idx] = 1
-    if undec_idx:   u[undec_idx] = 1
-    return torch.cat([d, e, u], dim=0)
-
-
-def sic_decode(actions, total_slots):
-    slots = [[] for _ in range(total_slots)]
-    for user_id, (r, slot_list) in enumerate(actions):
-        for s in slot_list[:r]:
-            slots[s].append(user_id)
-    decoded_users = set()
-    progress = True
-    while progress:
-        progress = False
-        for s in range(total_slots):
-            if len(slots[s]) == 1:
-                u = slots[s][0]
-                if u not in decoded_users:
-                    decoded_users.add(u)
-                    for t in range(total_slots):
-                        if u in slots[t]:
-                            slots[t].remove(u)
-                    progress = True
-    return decoded_users
 
 
 # =========================
@@ -554,16 +444,9 @@ def main():
         sys.exit(1)
 
     if args.torch_single_core:
-        torch.set_num_threads(1)
+        set_torch_single_core()
 
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
-        try:
-            import random
-            random.seed(args.seed)
-        except ImportError:
-            pass
+    set_seed(args.seed)
 
     cfg = {
         'num_users': args.users,
