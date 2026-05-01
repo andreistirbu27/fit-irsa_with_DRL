@@ -1,7 +1,7 @@
 """Common result-directory conventions."""
 import os
 
-RESULTS_ROOT = "results"
+RESULTS_ROOT = os.path.join("results", "new")
 
 
 def under_results(name):

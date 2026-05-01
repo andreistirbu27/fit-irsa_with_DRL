@@ -40,7 +40,7 @@ def prepare_forward_args(cfg, obs, feedback, prev_action):
     return x
 
 
-result_dir = "results/result-u4-s2"  # Change as needed
+result_dir = "results/new/<edit-me>"  # point this at the run you want to inspect
 
 
 # Use the function from irsa_2phases to load the latest model

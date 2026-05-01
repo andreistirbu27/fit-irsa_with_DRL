@@ -1,7 +1,7 @@
-results/
 .DS_Store
 .idea/
 __pycache__/
 *.pyc
 *.pdf
 *.md
+results/legacy/

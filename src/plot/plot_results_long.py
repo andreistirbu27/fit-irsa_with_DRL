@@ -124,12 +124,12 @@ def compute_array_stats(
 
 #%%
 
-# #print(os.listdir("res-long"))
+# #print(os.listdir("results/res-long"))
 
-# dir_name = "res-long/res-1p-u10-s10-e1000-b1000-s1"
-# dir_name = "res-long/res-u10-s5-e1000-b1000-s1"
-# #dir_name = "res-long/res-load-1p-u20-s20-e1000-b1000-s1"
-# #dir_name = "res-long/res-load-u20-s10-e1000-b1000-s1"
+# dir_name = "results/res-long/res-1p-u10-s10-e1000-b1000-s1"
+# dir_name = "results/res-long/res-u10-s5-e1000-b1000-s1"
+# #dir_name = "results/res-long/res-load-1p-u20-s20-e1000-b1000-s1"
+# #dir_name = "results/res-long/res-load-u20-s10-e1000-b1000-s1"
 # log_file_name = find_jsonl_file(dir_name)
 # # all_data = load_jsonl(log_file_name)
 
@@ -147,9 +147,9 @@ def compute_array_stats(
 
 def get_load_data(nb_users, nb_slots=20, one_phase=False, seed=1, prefix="-load"):
     if one_phase:
-        dir_name = f"res-long/res{prefix}-1p-u{nb_users}-s{nb_slots}-e1000-b1000-s{seed}"
+        dir_name = f"results/res-long/res{prefix}-1p-u{nb_users}-s{nb_slots}-e1000-b1000-s{seed}"
     else:
-        dir_name = f"res-long/res{prefix}-u{nb_users}-s{nb_slots//2}-e1000-b1000-s{seed}"
+        dir_name = f"results/res-long/res{prefix}-u{nb_users}-s{nb_slots//2}-e1000-b1000-s{seed}"
     log_file_name = find_jsonl_file(dir_name)
     all_data = load_jsonl(log_file_name)
 
