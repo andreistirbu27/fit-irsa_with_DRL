@@ -1,5 +1,6 @@
 """Logging and model checkpoint helpers shared across training scripts."""
 import glob
+import json
 import os
 import sys
 
@@ -28,6 +29,38 @@ def save_model(policy, result_dir, epoch=None):
     else:
         fname = os.path.join(result_dir, f"policy_epoch{epoch}.pt")
     torch.save(policy.state_dict(), fname)
+
+
+def load_model(result_dir, model_factory, which="final", device=None):
+    """Load a model checkpoint from a run directory.
+
+    model_factory(cfg) must return an nn.Module with the correct architecture.
+    The loaded state dict is applied with strict=True.
+    """
+    config_path = os.path.join(result_dir, "config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    model = model_factory(cfg)
+
+    if which == "final":
+        model_path = os.path.join(result_dir, "policy_final.pt")
+    elif isinstance(which, (int, str)) and str(which).isdigit():
+        model_path = os.path.join(result_dir, f"policy_epoch{which}.pt")
+    else:
+        raise ValueError(f"Invalid 'which' argument: {which}")
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+    if device is not None:
+        model.to(device)
+    model.eval()
+    return model, cfg
 
 
 def cleanup_old_models(result_dir, keep_last=2):

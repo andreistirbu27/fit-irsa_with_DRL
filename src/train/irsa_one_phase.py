@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument('--learning-rate', type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument('--compress', action='store_true', help='Compress log file with gzip')
     parser.add_argument('--log', action='store_true')
+    parser.add_argument('--prefix', type=str, default="")
     parser.add_argument('--epoch-save-interval', type=int, default=200, help='Save model every N epochs')
     parser.add_argument('--result-dir', type=str, default=None, help='Override result dir')
     parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS, help='Keep only the last X saved models (default=2)')
@@ -47,8 +48,11 @@ def make_result_dir(cfg):
     if cfg['result_dir'] is not None:
         result_dir = cfg['result_dir']
     else:
+        base = "res-1p"
+        if cfg.get("prefix"):
+            base += "-" + cfg["prefix"]
         parts = [
-            f"res-plain-u{cfg['num_users']}",
+            f"{base}-u{cfg['num_users']}",
             f"s{cfg['num_slots']}"
         ]
         if cfg['hidden_dim'] != DEFAULT_HIDDEN_DIM:
@@ -68,62 +72,12 @@ def make_result_dir(cfg):
 
 # === Model loading function ===
 def load_model_from_dir(result_dir, which="final", device=None):
-    """
-    Load a PolicyNetUser model from a directory.
+    from src.irsa_common.io import load_model
 
-    Args:
-        result_dir (str): Directory containing the model and config.json.
-        which (str or int): "final" for policy_final.pt, or an epoch number for policy_epoch{epoch}.pt.
-        device: torch device to load to (default: None, uses torch default).
+    def factory(cfg):
+        return PolicyNetUser(cfg['input_obs_dim'], cfg['hidden_dim'], cfg['num_slots'])
 
-    Returns:
-        model: PolicyNetUser instance with loaded weights.
-        cfg: configuration dictionary loaded from config.json.
-    """
-    config_path = os.path.join(result_dir, "config.json")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    with open(config_path, "r") as f:
-        cfg = json.load(f)
-
-    # Derived dims for single-round: input is only random noise
-    input_dim = cfg['input_obs_dim']
-
-    class PolicyNetUser(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, cfg['hidden_dim']),
-                nn.ReLU(),
-                nn.Linear(cfg['hidden_dim'], cfg['num_slots'])
-            )
-            with torch.no_grad():
-                last = self.net[-1]
-                if isinstance(last, nn.Linear):
-                    last.bias.fill_(-1.4)
-
-        def forward(self, x):
-            return self.net(x)
-
-    if which == "final":
-        model_path = os.path.join(result_dir, "policy_final.pt")
-    elif isinstance(which, int):
-        model_path = os.path.join(result_dir, f"policy_epoch{which}.pt")
-    elif isinstance(which, str) and which.isdigit():
-        model_path = os.path.join(result_dir, f"policy_epoch{which}.pt")
-    else:
-        raise ValueError(f"Invalid 'which' argument: {which}")
-
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    model = PolicyNetUser()
-    state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict)
-    if device is not None:
-        model.to(device)
-    model.eval()
-    return model, cfg
+    return load_model(result_dir, factory, which=which, device=device)
 
 
 def main():
@@ -154,6 +108,7 @@ def main():
         'result_dir': args.result_dir,
         'keep_last_models': args.keep_last_models,
         'seed': args.seed,
+        'prefix': args.prefix,
     }
 
     # --- Derived dims (single round: input is only random noise) ---
@@ -247,9 +202,15 @@ def main():
             avg_decoded_history.append(np.mean(batch_decoded))
 
             # optional logging
-            #rec = {"epoch": epoch, "reward": float(baseline), "avg_decoded": float(avg_decoded_history[-1]), "activity": last_activity, "lambda": lam}
             if args.log:
-                rec = {"epoch": epoch, "decoded_array": batch_decoded}            
+                rec = {
+                    "epoch": epoch,
+                    "decoded_array": batch_decoded,
+                    "reward": float(baseline),
+                    "avg_decoded": float(avg_decoded_history[-1]),
+                    "activity": float(last_activity),
+                    "lambda": float(lam),
+                }
                 print(json.dumps(rec), file=log_f, flush=True)
 
             if epoch % 100 == 0:

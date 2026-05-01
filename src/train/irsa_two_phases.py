@@ -50,9 +50,9 @@ def parse_args():
     return parser.parse_args()
 
 def make_result_dir(cfg):
-    base = "res"
+    base = "res-2p"
     if cfg["prefix"] is not None and cfg["prefix"] != "":
-        base += "-"+cfg["prefix"]
+        base += "-" + cfg["prefix"]
     if cfg['result_dir'] is not None:
         result_dir = cfg['result_dir']
     else:
@@ -77,68 +77,15 @@ def make_result_dir(cfg):
 
 # === Model loading function ===
 def load_model_from_dir(result_dir, which="final", device=None):
-    """
-    Load a PolicyNetUser model from a directory.
+    from src.irsa_common.io import load_model
 
-    Args:
-        result_dir (str): Directory containing the model and config.json.
-        which (str or int): "final" for policy_final.pt, or an epoch number for policy_epoch{epoch}.pt.
-        device: torch device to load to (default: None, uses torch default).
+    def factory(cfg):
+        prev_action_dim = cfg['num_slots']
+        feedback_dim = 3 * cfg['num_slots']
+        input_dim = cfg['input_obs_dim'] + feedback_dim + prev_action_dim
+        return PolicyNetUser(input_dim, cfg['hidden_dim'], cfg['num_slots'])
 
-    Returns:
-        model: PolicyNetUser instance with loaded weights.
-        cfg: configuration dictionary loaded from config.json.
-    """
-    # Load config
-    config_path = os.path.join(result_dir, "config.json")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    with open(config_path, "r") as f:
-        cfg = json.load(f)
-
-    # Derived dims
-    prev_action_dim = cfg['num_slots']
-    feedback_dim = 3 * cfg['num_slots']
-    input_dim = cfg['input_obs_dim'] + feedback_dim + prev_action_dim
-
-    # Define PolicyNetUser class (must match training definition)
-    class PolicyNetUser(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, cfg['hidden_dim']),
-                nn.ReLU(),
-                nn.Linear(cfg['hidden_dim'], cfg['num_slots'])
-            )
-            with torch.no_grad():
-                last = self.net[-1]
-                if isinstance(last, nn.Linear):
-                    last.bias.fill_(-1.4)
-
-        def forward(self, x):
-            return self.net(x)
-
-    # Determine model file
-    if which == "final":
-        model_path = os.path.join(result_dir, "policy_final.pt")
-    elif isinstance(which, int):
-        model_path = os.path.join(result_dir, f"policy_epoch{which}.pt")
-    elif isinstance(which, str) and which.isdigit():
-        model_path = os.path.join(result_dir, f"policy_epoch{which}.pt")
-    else:
-        raise ValueError(f"Invalid 'which' argument: {which}")
-
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    # Instantiate and load model
-    model = PolicyNetUser()
-    state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict)
-    if device is not None:
-        model.to(device)
-    model.eval()
-    return model, cfg
+    return load_model(result_dir, factory, which=which, device=device)
 
 
 
@@ -283,7 +230,17 @@ def train(policy, optimizer, cfg,
 
         # optional logging
         if log_file is not None:
-            rec = {"epoch": epoch, "decoded_array": batch_uniques}
+            rec = {
+                "epoch": epoch,
+                "decoded_array": batch_uniques,
+                "avg_reward": float(baseline),
+                "avg_unique": float(avg_unique_history[-1]),
+                "frac_decR1_txR2": float(frac_decR1_txR2_hist[-1]),
+                "r1_activity": float(last_r1_act),
+                "r2_activity": float(last_r2_act),
+                "lambda_r1": float(lam_r1),
+                "lambda_r2": float(lam_r2),
+            }
             print(json.dumps(rec), file=log_file, flush=True)
 
         if epoch % 100 == 0:
@@ -293,6 +250,10 @@ def train(policy, optimizer, cfg,
                   f"frac(R1-decoded tx in R2)={frac_decR1_txR2_hist[-1]:.3f}, "
                   f"R1 act={last_r1_act:.3f} (λ1={lam_r1:.4f}), "
                   f"R2 act={last_r2_act:.3f} (λ2={lam_r2:.4f})")
+
+        if (epoch + 1) % cfg['epoch_save_interval'] == 0:
+            save_model(policy, cfg['result_dir'], epoch=epoch + 1)
+            cleanup_old_models(cfg['result_dir'], keep_last=cfg['keep_last_models'])
 
     return reward_history, avg_unique_history, frac_decR1_txR2_hist
 

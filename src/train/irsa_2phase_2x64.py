@@ -58,7 +58,7 @@ def parse_args():
     return parser.parse_args()
 
 def make_result_dir(cfg):
-    base = "res"
+    base = "res-2p-2x64"
     if cfg["prefix"] is not None and cfg["prefix"] != "":
         base += "-" + cfg["prefix"]
     if cfg['result_dir'] is not None:
@@ -87,71 +87,16 @@ def make_result_dir(cfg):
 
 # === Model loading function ===
 def load_model_from_dir(result_dir, which="final", device=None):
-    """
-    Load a PolicyNetUser model from a directory.
+    from src.irsa_common.io import load_model
 
-    Args:
-        result_dir (str): Directory containing the model and config.json.
-        which (str or int): "final" for policy_final.pt, or an epoch number for policy_epoch{epoch}.pt.
-        device: torch device to load to (default: None, uses torch default).
+    def factory(cfg):
+        prev_action_dim = cfg['num_slots']
+        feedback_dim = 3 * cfg['num_slots']
+        input_dim = cfg['input_obs_dim'] + feedback_dim + prev_action_dim
+        num_layers = cfg.get('num_layers', DEFAULT_NUM_LAYERS)
+        return PolicyNetUser(input_dim, cfg['hidden_dim'], cfg['num_slots'], num_layers)
 
-    Returns:
-        model: PolicyNetUser instance with loaded weights.
-        cfg: configuration dictionary loaded from config.json.
-    """
-    # Load config
-    config_path = os.path.join(result_dir, "config.json")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    with open(config_path, "r") as f:
-        cfg = json.load(f)
-
-    # Derived dims
-    prev_action_dim = cfg['num_slots']
-    feedback_dim = 3 * cfg['num_slots']
-    input_dim = cfg['input_obs_dim'] + feedback_dim + prev_action_dim
-    num_layers = cfg.get('num_layers', DEFAULT_NUM_LAYERS)
-
-    # Define PolicyNetUser class (must match training definition)
-    class PolicyNetUser(nn.Module):
-        def __init__(self):
-            super().__init__()
-            layers = []
-            in_dim = input_dim
-            for _ in range(num_layers):
-                layers += [nn.Linear(in_dim, cfg['hidden_dim']), nn.ReLU()]
-                in_dim = cfg['hidden_dim']
-            layers += [nn.Linear(in_dim, cfg['num_slots'])]
-            self.net = nn.Sequential(*layers)
-            with torch.no_grad():
-                last = self.net[-1]
-                if isinstance(last, nn.Linear):
-                    last.bias.fill_(-1.4)
-
-        def forward(self, x):
-            return self.net(x)
-
-    # Determine model file
-    if which == "final":
-        model_path = os.path.join(result_dir, "policy_final.pt")
-    elif isinstance(which, int):
-        model_path = os.path.join(result_dir, f"policy_epoch{which}.pt")
-    elif isinstance(which, str) and which.isdigit():
-        model_path = os.path.join(result_dir, f"policy_epoch{which}.pt")
-    else:
-        raise ValueError(f"Invalid 'which' argument: {which}")
-
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    # Instantiate and load model
-    model = PolicyNetUser()
-    state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict)
-    if device is not None:
-        model.to(device)
-    model.eval()
-    return model, cfg
+    return load_model(result_dir, factory, which=which, device=device)
 
 # === Single-user policy (training-time) ===
 class PolicyNetUser(nn.Module):
@@ -295,7 +240,17 @@ def train(policy, optimizer, cfg,
 
         # optional logging
         if log_file is not None:
-            rec = {"epoch": epoch, "decoded_array": batch_uniques}
+            rec = {
+                "epoch": epoch,
+                "decoded_array": batch_uniques,
+                "avg_reward": float(baseline),
+                "avg_unique": float(avg_unique_history[-1]),
+                "frac_decR1_txR2": float(frac_decR1_txR2_hist[-1]),
+                "r1_activity": float(last_r1_act),
+                "r2_activity": float(last_r2_act),
+                "lambda_r1": float(lam_r1),
+                "lambda_r2": float(lam_r2),
+            }
             print(json.dumps(rec), file=log_file, flush=True)
 
         if epoch % 100 == 0:
@@ -303,10 +258,9 @@ def train(policy, optimizer, cfg,
                   f"Avg Reward={baseline:.3f}, "
                   f"Avg decoded={avg_unique_history[-1]:.2f}/{num_users}")
 
-        # Optional: cleanup periodic checkpoints
-        # if (epoch + 1) % cfg['epoch_save_interval'] == 0:
-        #     save_model(policy, cfg['result_dir'], epoch=epoch+1)
-        #     cleanup_old_models(cfg['result_dir'], keep_last=cfg['keep_last_models'])
+        if (epoch + 1) % cfg['epoch_save_interval'] == 0:
+            save_model(policy, cfg['result_dir'], epoch=epoch + 1)
+            cleanup_old_models(cfg['result_dir'], keep_last=cfg['keep_last_models'])
 
     return reward_history, avg_unique_history, frac_decR1_txR2_hist
 
@@ -378,17 +332,17 @@ def main():
     # === Print avg decoded users over last 500 / 1000 epochs ===
     window = 400
     if len(avg_unique) >= window:
-        avg_last_decoded = np.mean(avg_unique[-window:])
+        avg_last_400 = np.mean(avg_unique[-window:])
     else:
-        avg_last_decoded = np.mean(avg_unique)
-    print(f"\nAverage users decoded (concatenated) over last {window} epochs: {avg_last_decoded:.3f}")
+        avg_last_400 = np.mean(avg_unique)
+    print(f"\nAverage users decoded (concatenated) over last {window} epochs: {avg_last_400:.3f}")
 
     window = 1000
     if len(avg_unique) >= window:
-        avg_last_decoded = np.mean(avg_unique[-window:])
+        avg_last_1000 = np.mean(avg_unique[-window:])
     else:
-        avg_last_decoded = np.mean(avg_unique)
-    print(f"Average users decoded (concatenated) over last {window} epochs: {avg_last_decoded:.3f}")
+        avg_last_1000 = np.mean(avg_unique)
+    print(f"Average users decoded (concatenated) over last {window} epochs: {avg_last_1000:.3f}")
 
 if __name__ == "__main__":
     main()

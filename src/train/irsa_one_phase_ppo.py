@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument('--users', type=int, required=True)
     parser.add_argument('--slots', type=int, required=True)
     parser.add_argument('--torch-single-core', default=False, action="store_true")
-    parser.add_argument('--input-obs-dim', type=int, default=4)
+    parser.add_argument('--input-obs-dim', type=int, default=3)
     parser.add_argument('--hidden-dim', type=int, default=DEFAULT_HIDDEN_DIM)
     parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS)
     parser.add_argument('--batch-size', type=int, default=DEFAULT_BATCH_SIZE,
@@ -68,7 +68,7 @@ def parse_args():
 
 
 def make_result_dir(cfg):
-    base = "res-ppo1"
+    base = "res-1p-ppo"
     if cfg["prefix"] is not None and cfg["prefix"] != "":
         base += "-" + cfg["prefix"]
     if cfg['result_dir'] is not None:
@@ -91,31 +91,12 @@ def make_result_dir(cfg):
 
 
 def load_model_from_dir(result_dir, which="final", device=None):
-    config_path = os.path.join(result_dir, "config.json")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    with open(config_path, "r") as f:
-        cfg = json.load(f)
+    from src.irsa_common.io import load_model
 
-    input_dim = cfg['input_obs_dim']
-    model = ActorCriticUser(input_dim, cfg['hidden_dim'], cfg['num_slots'])
+    def factory(cfg):
+        return ActorCriticUser(cfg['input_obs_dim'], cfg['hidden_dim'], cfg['num_slots'])
 
-    if which == "final":
-        model_path = os.path.join(result_dir, "policy_final.pt")
-    elif isinstance(which, int) or (isinstance(which, str) and which.isdigit()):
-        model_path = os.path.join(result_dir, f"policy_epoch{which}.pt")
-    else:
-        raise ValueError(f"Invalid 'which' argument: {which}")
-    
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict, strict=False)
-    if device is not None:
-        model.to(device)
-    model.eval()
-    return model, cfg
+    return load_model(result_dir, factory, which=which, device=device)
 
 
 class ActorCriticUser(nn.Module):
@@ -229,8 +210,6 @@ def train_ppo(model, optimizer, cfg, sparsity_max=0.02, warmup=400, log_file=Non
                 act_bin_buf.append(a_u)
                 old_logp_buf.append(lp_u.detach())
                 val_buf.append(v_u.detach())
-                # placeholder; per-user bandit reward filled in after decode
-                rew_buf.append(torch.tensor(0.0))
                 done_buf.append(torch.tensor(1.0))
 
             acts_bin = torch.stack(acts_bin, dim=0)
@@ -244,8 +223,7 @@ def train_ppo(model, optimizer, cfg, sparsity_max=0.02, warmup=400, log_file=Non
 
             # Per-user bandit: each user step is its own one-step episode (dones=1),
             # all sharing the joint global reward. No γ chain across users.
-            for k in range(num_users):
-                rew_buf[-num_users + k] = torch.tensor(reward_adjusted)
+            rew_buf.extend([torch.tensor(reward_adjusted)] * num_users)
 
             batch_decoded.append(num_decoded)
 
@@ -263,7 +241,14 @@ def train_ppo(model, optimizer, cfg, sparsity_max=0.02, warmup=400, log_file=Non
         avg_decoded_history.append(np.mean(batch_decoded))
 
         if log_file is not None:
-            rec = {"epoch": epoch, "decoded_array": batch_decoded}
+            rec = {
+                "epoch": epoch,
+                "decoded_array": batch_decoded,
+                "reward": float(baseline),
+                "avg_decoded": float(avg_decoded_history[-1]),
+                "activity": float(last_activity),
+                "lambda": float(lam),
+            }
             print(json.dumps(rec), file=log_file, flush=True)
 
         if epoch % 100 == 0:
@@ -274,7 +259,7 @@ def train_ppo(model, optimizer, cfg, sparsity_max=0.02, warmup=400, log_file=Non
 
         if (epoch + 1) % cfg['epoch_save_interval'] == 0:
             save_model(model, cfg['result_dir'], epoch=epoch + 1)
-            cleanup_old_models(cfg['result_dir'], cfg['keep_last_models'])
+            cleanup_old_models(cfg['result_dir'], keep_last=cfg['keep_last_models'])
 
     return reward_history, avg_decoded_history
 

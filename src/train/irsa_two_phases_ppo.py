@@ -82,7 +82,7 @@ def parse_args():
 # Result dir / logging utils
 # =========================
 def make_result_dir(cfg):
-    base = "res"
+    base = "res-2p-ppo"
     if cfg["prefix"] is not None and cfg["prefix"] != "":
         base += "-" + cfg["prefix"]
     if cfg['result_dir'] is not None:
@@ -108,58 +108,18 @@ def make_result_dir(cfg):
 
 
 # =========================
-# Loader (updated to Actor-Critic)
+# Loader
 # =========================
 def load_model_from_dir(result_dir, which="final", device=None):
-    config_path = os.path.join(result_dir, "config.json")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    with open(config_path, "r") as f:
-        cfg = json.load(f)
+    from src.irsa_common.io import load_model
 
-    prev_action_dim = cfg['num_slots']
-    feedback_dim = 3 * cfg['num_slots']
-    input_dim = cfg['input_obs_dim'] + feedback_dim + prev_action_dim
+    def factory(cfg):
+        prev_action_dim = cfg['num_slots']
+        feedback_dim = 3 * cfg['num_slots']
+        input_dim = cfg['input_obs_dim'] + feedback_dim + prev_action_dim
+        return ActorCriticUser(input_dim, cfg['hidden_dim'], cfg['num_slots'])
 
-    class ActorCriticUser(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.body = nn.Sequential(
-                nn.Linear(input_dim, cfg['hidden_dim']),
-                nn.ReLU(),
-                nn.Linear(cfg['hidden_dim'], cfg['hidden_dim']),
-                nn.ReLU(),
-            )
-            self.pi = nn.Linear(cfg['hidden_dim'], cfg['num_slots'])  # policy logits per slot (Multi-Bernoulli)
-            self.v = nn.Linear(cfg['hidden_dim'], 1)
-            with torch.no_grad():
-                self.pi.bias.fill_(-1.4)
-
-        def forward(self, x):
-            h = self.body(x)
-            logits = self.pi(h)
-            value = self.v(h).squeeze(-1)
-            return logits, value
-
-    if which == "final":
-        model_path = os.path.join(result_dir, "policy_final.pt")
-    elif isinstance(which, int):
-        model_path = os.path.join(result_dir, f"policy_epoch{which}.pt")
-    elif isinstance(which, str) and which.isdigit():
-        model_path = os.path.join(result_dir, f"policy_epoch{which}.pt")
-    else:
-        raise ValueError(f"Invalid 'which' argument: {which}")
-
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    model = ActorCriticUser()
-    state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict, strict=False)
-    if device is not None:
-        model.to(device)
-    model.eval()
-    return model, cfg
+    return load_model(result_dir, factory, which=which, device=device)
 
 
 # =========================
@@ -323,7 +283,6 @@ def train_ppo(model, optimizer, cfg,
                 act_bin_buf.append(a_u)
                 old_logp_buf.append(lp_u.detach())
                 val_buf.append(v_u.detach())
-                rew_buf.append(torch.tensor(0.0))
                 done_buf.append(torch.tensor(1.0))
 
             acts_bin_r1 = torch.stack(acts_bin_r1, dim=0)
@@ -349,7 +308,6 @@ def train_ppo(model, optimizer, cfg,
                 act_bin_buf.append(a_u)
                 old_logp_buf.append(lp_u.detach())
                 val_buf.append(v_u.detach())
-                rew_buf.append(torch.tensor(0.0))
                 done_buf.append(torch.tensor(1.0))
 
             acts_bin_r2 = torch.stack(acts_bin_r2, dim=0)
@@ -384,9 +342,7 @@ def train_ppo(model, optimizer, cfg,
 
             # Per-user bandit: write the joint global reward to each of the
             # 2*num_users one-step episodes just collected.
-            episode_len = 2 * num_users
-            for k in range(episode_len):
-                rew_buf[-episode_len + k] = torch.tensor(reward_adjusted)
+            rew_buf.extend([torch.tensor(reward_adjusted)] * (2 * num_users))
 
             batch_uniques.append(num_decoded_concat)
             batch_frac_decR1_txR2.append(frac_decR1_txR2)
@@ -410,7 +366,17 @@ def train_ppo(model, optimizer, cfg,
         frac_decR1_txR2_hist.append(np.nanmean(batch_frac_decR1_txR2))
 
         if log_file is not None:
-            rec = {"epoch": epoch, "decoded_array": batch_uniques}
+            rec = {
+                "epoch": epoch,
+                "decoded_array": batch_uniques,
+                "avg_reward": float(baseline),
+                "avg_unique": float(avg_unique_history[-1]),
+                "frac_decR1_txR2": float(frac_decR1_txR2_hist[-1]),
+                "r1_activity": float(last_r1_act),
+                "r2_activity": float(last_r2_act),
+                "lambda_r1": float(lam_r1),
+                "lambda_r2": float(lam_r2),
+            }
             print(json.dumps(rec), file=log_file, flush=True)
 
         if epoch % 100 == 0:
@@ -423,7 +389,7 @@ def train_ppo(model, optimizer, cfg,
         # Optional checkpointing
         if (epoch + 1) % cfg['epoch_save_interval'] == 0:
             save_model(model, cfg['result_dir'], epoch=epoch + 1)
-            cleanup_old_models(cfg['result_dir'], cfg['keep_last_models'])
+            cleanup_old_models(cfg['result_dir'], keep_last=cfg['keep_last_models'])
 
     return reward_history, avg_unique_history, frac_decR1_txR2_hist
 
