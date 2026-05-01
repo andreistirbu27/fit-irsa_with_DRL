@@ -7,9 +7,22 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, 
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from src.train import irsa_two_phases
+from src.irsa_common.sic import sample_actions_user
 
-# Load model using function from irsa_2phases
+
+def _load_two_phase_model(result_dir, which="final", device=None):
+    """Dispatch to the correct loader based on the run's config.json."""
+    import json
+    config_path = os.path.join(result_dir, "config.json")
+    with open(config_path) as f:
+        cfg_peek = json.load(f)
+    if "clip_eps" in cfg_peek:
+        from src.train.irsa_two_phases_ppo import load_model_from_dir
+    elif "num_layers" in cfg_peek:
+        from src.train.irsa_2phase_2x64 import load_model_from_dir
+    else:
+        from src.train.irsa_two_phases import load_model_from_dir
+    return load_model_from_dir(result_dir, which=which, device=device)
 
 
 def prepare_forward_args(cfg, obs, feedback, prev_action):
@@ -42,23 +55,27 @@ def prepare_forward_args(cfg, obs, feedback, prev_action):
 
 result_dir = "results/new/<edit-me>"  # point this at the run you want to inspect
 
+if "<edit-me>" in result_dir:
+    raise ValueError("Edit `result_dir` to point at a real run before executing this script.")
 
-# Use the function from irsa_2phases to load the latest model
-policy, cfg = irsa_two_phases.load_model_from_dir(result_dir)
+policy, cfg = _load_two_phase_model(result_dir)
 
 policy.eval()
 print("Model loaded from", result_dir)
 
 import torch
 
-model_input = prepare_forward_args(cfg, [0.1,1,0], 3*[0,0], [0,0])
+dummy_obs = [0.0] * cfg['input_obs_dim']
+dummy_feedback = [0] * (3 * cfg['num_slots'])
+dummy_prev_action = [0] * cfg['num_slots']
+model_input = prepare_forward_args(cfg, dummy_obs, dummy_feedback, dummy_prev_action)
 with torch.no_grad():
-    logits = policy.forward(model_input)
+    output = policy.forward(model_input)
+    logits = output[0] if isinstance(output, tuple) else output  # PPO returns (logits, value)
     probs = torch.sigmoid(logits)
     print(probs)
-    # Sample Bernoulli decision for each slot
-    action = torch.bernoulli(probs)
-print("Sampled action (Bernoulli):", action.numpy())
+    _, _, action = sample_actions_user(logits)
+print("Sampled action:", action.numpy())
 
 
 #%%

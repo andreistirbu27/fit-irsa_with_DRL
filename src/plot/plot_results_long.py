@@ -11,13 +11,15 @@ from scipy.stats import t
 def find_jsonl_file(run_dir):
     """
     Find a .jsonl or .jsonl.gz file in the given directory.
+    Prefers .jsonl.gz over .jsonl when both exist.
     Returns the path to the file, or raises FileNotFoundError.
     """
-    for fname in os.listdir(run_dir):
-        if fname.endswith('.jsonl'):
-            return os.path.join(run_dir, fname)
-        if fname.endswith('.jsonl.gz'):
-            return os.path.join(run_dir, fname)
+    gz = next((os.path.join(run_dir, f) for f in os.listdir(run_dir) if f.endswith('.jsonl.gz')), None)
+    if gz is not None:
+        return gz
+    plain = next((os.path.join(run_dir, f) for f in os.listdir(run_dir) if f.endswith('.jsonl')), None)
+    if plain is not None:
+        return plain
     raise FileNotFoundError("No .jsonl or .jsonl.gz file found in {}".format(run_dir))
 
 def load_jsonl(path):
@@ -34,6 +36,7 @@ def load_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 def smooth_sma(x, k=31):
+    # mode="same" pads with zeros at boundaries; first/last k//2 samples droop toward zero.
     x = np.asarray(x, dtype=float)
     if len(x) < k:
         return x
@@ -87,9 +90,9 @@ def compute_array_stats(
         mean = batch_array.mean()
         std = batch_array.std(ddof=1)
         n = len(batch_array)
-        # confidence interval
+        # two-sided confidence interval
         if n > 1:
-            ci = t.ppf(confidence, n-1) * std / np.sqrt(n)
+            ci = t.ppf((1 + confidence) / 2, n - 1) * std / np.sqrt(n)
         else:
             ci = 0.0
         means.append(mean)
@@ -107,7 +110,7 @@ def compute_array_stats(
         std = batch_array.std(ddof=1)
         n = len(batch_array)
         if n > 1:
-            ci = t.ppf(confidence, n-1) * std / np.sqrt(n)
+            ci = t.ppf((1 + confidence) / 2, n - 1) * std / np.sqrt(n)
         else:
             ci = 0.0
         means.append(mean)
@@ -156,7 +159,6 @@ def get_load_data(nb_users, nb_slots=20, one_phase=False, seed=1, prefix="-load"
     NB_PARTS = 10 # we take statistics on the last 1/NB_PARTS
 
     K = int(len(all_data)//NB_PARTS)
-    assert (len(all_data) % K) == 0
     #K = 250  # Set the window size for statistics
     ARRAY_KEY = "decoded_array"  # Change this to the desired key if needed
     LABEL = "Mean"  # Change this to a more descriptive label if needed
@@ -253,7 +255,7 @@ def plot_throughtput_vs_users_slots(prefix="-load", normalize=False, nb_slots=20
     if xlim is not None:
         plt.xlim(*xlim)
     if fig_file_name is not None:
-        plt.savefig("throughput-vs-users-20slots.pdf")
+        plt.savefig(fig_file_name)
     plt.show()
 
 
