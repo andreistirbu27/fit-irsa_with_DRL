@@ -20,29 +20,29 @@ Everything runs on CPU and is intentionally single-threaded by default in sweeps
 Pick a variant and call it as a module from the repo root:
 
 ```bash
-python -m src.train.irsa_two_phases --users 5 --slots 3 --epochs 2000 --log --compress
+python -m src.train.irsa_two_phases --users 5 --slots 3 --seed 1 --epochs 2000 --log --compress
 ```
 
-That writes a directory under `results/new/` (e.g. `results/new/res-u5-s3/`) containing:
+That writes a directory under `results/new/` (e.g. `results/new/res-2p-u5-s3-seed1/`) containing:
 - `config.json` — exact hyperparameters
 - `train_log.jsonl.gz` — per-epoch metrics
 - `policy_final.pt` plus a couple of checkpoints
 
 The variants live in [src/train/](src/train/):
 
-| File | Algorithm | Setting | Network |
-|------|-----------|---------|---------|
-| `irsa_one_phase.py` | REINFORCE | single round | 1 hidden × 128 |
-| `irsa_two_phases.py` | REINFORCE | two rounds + feedback | 1 hidden × 128 |
-| `irsa_2phase_2x64.py` | REINFORCE | two rounds + feedback | configurable depth (default 2 × 64) |
-| `irsa_one_phase_ppo.py` | PPO | single round | actor-critic, 2 × 128 |
-| `irsa_two_phases_ppo.py` | PPO | two rounds + feedback | actor-critic, 2 × 128 |
+| File | Algorithm | Setting | Network | Result-dir prefix |
+|------|-----------|---------|---------|-------------------|
+| `irsa_one_phase.py` | REINFORCE | single round | 1 hidden × 128 | `res-1p` |
+| `irsa_two_phases.py` | REINFORCE | two rounds + feedback | 1 hidden × 128 | `res-2p` |
+| `irsa_2phase_2x64.py` | REINFORCE | two rounds + feedback | configurable depth (default 2 × 64) | `res-2p-2x64` |
+| `irsa_one_phase_ppo.py` | PPO | single round | actor-critic, 2 × 128 | `res-1p-ppo` |
+| `irsa_two_phases_ppo.py` | PPO | two rounds + feedback | actor-critic, 2 × 128 | `res-2p-ppo` |
 
-All scripts share a common set of CLI flags: `--users --slots --epochs --batch-size --learning-rate --hidden-dim --seed --prefix --log --compress`. PPO scripts add `--clip-eps --value-coef --entropy-coef --gamma --gae-lambda --ppo-epochs --minibatch-size --max-grad-norm`. Run any script with `--help` to see everything.
+All scripts share a common set of CLI flags: `--users --slots --seed --epochs --batch-size --learning-rate --hidden-dim --prefix --log --compress`. PPO scripts add `--clip-eps --value-coef --entropy-coef --gamma --gae-lambda --ppo-epochs --minibatch-size --max-grad-norm`. `irsa_2phase_2x64.py` adds `--num-layers`. Run any script with `--help` to see everything.
 
 ## Sweeps
 
-[scripts/run-var-users.sh](scripts/run-var-users.sh) and [scripts/run-var-load.sh](scripts/run-var-load.sh) launch parameter sweeps via the `tsp` task spooler (32 parallel jobs). Edit the loop ranges as needed and run from the repo root:
+[scripts/run-var-users.sh](scripts/run-var-users.sh) and [scripts/run-var-load.sh](scripts/run-var-load.sh) launch parameter sweeps via the `tsp` task spooler (32 parallel jobs). Both iterate over seeds 1–4. Edit the loop ranges as needed and run from the repo root:
 
 ```bash
 bash scripts/run-var-users.sh
@@ -58,7 +58,7 @@ python -m src.plot.plot_results_long
 
 ## Evaluating a trained model
 
-[src/eval/eval_two_phases.py](src/eval/eval_two_phases.py) loads a saved policy and runs forward passes on a single example. Edit the `result_dir` near the top of the file to point at the run you want to inspect.
+[src/eval/eval_two_phases.py](src/eval/eval_two_phases.py) loads a saved policy and runs a forward pass on a single example. Edit the `result_dir` near the top of the file to point at the run you want to inspect. The script auto-detects the variant (REINFORCE / 2×64 / PPO) from `config.json`, so it works with any of the three two-phase training scripts.
 
 ## Repo layout
 
