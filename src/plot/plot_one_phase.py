@@ -8,11 +8,15 @@ import matplotlib.pyplot as plt
 def find_jsonl_file(run_dir):
     """
     Find a .jsonl or .jsonl.gz file in the given directory.
+    Prefers .jsonl.gz over .jsonl when both exist.
     Returns the path to the file, or raises FileNotFoundError.
     """
-    for fname in os.listdir(run_dir):
-        if fname.endswith('.jsonl') or fname.endswith('.jsonl.gz'):
-            return os.path.join(run_dir, fname)
+    gz = next((os.path.join(run_dir, f) for f in os.listdir(run_dir) if f.endswith('.jsonl.gz')), None)
+    if gz is not None:
+        return gz
+    plain = next((os.path.join(run_dir, f) for f in os.listdir(run_dir) if f.endswith('.jsonl')), None)
+    if plain is not None:
+        return plain
     raise FileNotFoundError(f"No .jsonl or .jsonl.gz file found in {run_dir}")
 
 def load_jsonl(path):
@@ -29,6 +33,7 @@ def load_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 def smooth_sma(x, k=31):
+    # mode="same" pads with zeros at boundaries; first/last k//2 samples droop toward zero.
     x = np.asarray(x, dtype=float)
     if len(x) < k:
         return x
