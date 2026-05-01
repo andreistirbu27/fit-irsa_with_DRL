@@ -32,15 +32,14 @@ DEFAULT_EPOCHS = 2000
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_LEARNING_RATE = 0.01
 DEFAULT_KEEP_LAST_MODELS = 2
-DEFAULT_SEED = 1000
 
 # =========================
 # Argparse
 # =========================
 def parse_args():
     parser = argparse.ArgumentParser(description="IRSA 2-Phases Training")
-    parser.add_argument('--users', type=int, default=30, help='Number of users (required)')
-    parser.add_argument('--slots', type=int, default=10, help='Number of slots (required)')
+    parser.add_argument('--users', type=int, required=True, help='Number of users')
+    parser.add_argument('--slots', type=int, required=True, help='Number of slots')
     parser.add_argument('--torch-single-core', default=False, action="store_true")
     parser.add_argument('--input-obs-dim', type=int, default=3)
     parser.add_argument('--hidden-dim', type=int, default=DEFAULT_HIDDEN_DIM)
@@ -55,7 +54,7 @@ def parse_args():
     parser.add_argument('--epoch-save-interval', type=int, default=200, help='Save model every N epochs')
     parser.add_argument('--result-dir', type=str, default=None, help='Override result dir')
     parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS, help='Keep only the last X saved models (default=2)')
-    parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help='Random seed (default=1)')
+    parser.add_argument('--seed', type=int, required=True, help='Random seed')
     return parser.parse_args()
 
 def make_result_dir(cfg):
@@ -80,9 +79,7 @@ def make_result_dir(cfg):
             parts.append(f"b{cfg['batch_size']}")
         if cfg['learning_rate'] != DEFAULT_LEARNING_RATE:
             parts.append(f"lr{cfg['learning_rate']}")
-        # Only add seed if it is not the default
-        if cfg.get('seed', DEFAULT_SEED) != DEFAULT_SEED:
-            parts.append(f"s{cfg['seed']}")
+        parts.append(f"seed{cfg['seed']}")
         result_dir = "-".join(parts)
         result_dir = under_results(result_dir)
     os.makedirs(result_dir, exist_ok=True)

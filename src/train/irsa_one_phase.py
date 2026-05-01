@@ -1,31 +1,33 @@
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import argparse
-import os
-import json
-import sys
 from tqdm import tqdm
-import shutil
-import glob
 
-try:
-    import gzip
-except ImportError:
-    gzip = None
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from src.irsa_common.io import get_log_file, save_model, cleanup_old_models
+from src.irsa_common.results import under_results
+from src.irsa_common.seed import set_seed, set_torch_single_core
+from src.irsa_common.sic import run_sic_simulation, sample_actions_user
 
 DEFAULT_HIDDEN_DIM = 128
 DEFAULT_EPOCHS = 2000
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_LEARNING_RATE = 0.01
 DEFAULT_KEEP_LAST_MODELS = 2
-DEFAULT_SEED = 1000
 
 def parse_args():
     parser = argparse.ArgumentParser(description="IRSA Single-Round Training")
-    parser.add_argument('--users', type=int, default=5, help='Number of users (required)')
-    parser.add_argument('--slots', type=int, default=6, help='Number of slots (required)')
+    parser.add_argument('--users', type=int, required=True, help='Number of users')
+    parser.add_argument('--slots', type=int, required=True, help='Number of slots')
     parser.add_argument('--torch-single-core', default=False, action="store_true")
     parser.add_argument('--input-obs-dim', type=int, default=3)
     parser.add_argument('--hidden-dim', type=int, default=DEFAULT_HIDDEN_DIM)
@@ -37,7 +39,7 @@ def parse_args():
     parser.add_argument('--epoch-save-interval', type=int, default=200, help='Save model every N epochs')
     parser.add_argument('--result-dir', type=str, default=None, help='Override result dir')
     parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS, help='Keep only the last X saved models (default=2)')
-    parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help='Random seed (default=1)')
+    parser.add_argument('--seed', type=int, required=True, help='Random seed')
     return parser.parse_args()
 
 
@@ -57,58 +59,11 @@ def make_result_dir(cfg):
             parts.append(f"b{cfg['batch_size']}")
         if cfg['learning_rate'] != DEFAULT_LEARNING_RATE:
             parts.append(f"lr{cfg['learning_rate']}")
-        # Only add seed if it is not the default
-        if cfg.get('seed', DEFAULT_SEED) != DEFAULT_SEED:
-            parts.append(f"s{cfg['seed']}")            
+        parts.append(f"seed{cfg['seed']}")
         result_dir = "-".join(parts)
+        result_dir = under_results(result_dir)
     os.makedirs(result_dir, exist_ok=True)
     return result_dir
-
-
-def get_log_file(result_dir, compress):
-    log_path = os.path.join(result_dir, "train_log.jsonl" + (".gz" if compress else ""))
-    if compress:
-        if gzip is None:
-            raise RuntimeError("gzip module not available for compression")
-        f = gzip.open(log_path, "at")
-    else:
-        f = open(log_path, "a")
-    return f, log_path
-
-
-def save_model(policy, result_dir, epoch=None):
-    if epoch is None:
-        fname = os.path.join(result_dir, "policy_final.pt")
-    else:
-        fname = os.path.join(result_dir, f"policy_epoch{epoch}.pt")
-    torch.save(policy.state_dict(), fname)
-
-
-def cleanup_old_models(result_dir, keep_last=DEFAULT_KEEP_LAST_MODELS):
-    """
-    Keep only the last `keep_last` policy_epoch*.pt files in result_dir.
-    Always keep policy_final.pt if present.
-    """
-    pattern = os.path.join(result_dir, "policy_epoch*.pt")
-    files = glob.glob(pattern)
-
-    def extract_epoch(f):
-        base = os.path.basename(f)
-        try:
-            num = int(base.replace("policy_epoch", "").replace(".pt", ""))
-            return num
-        except Exception:
-            return -1
-
-    files_epochs = [(f, extract_epoch(f)) for f in files]
-    files_epochs = sorted([fe for fe in files_epochs if fe[1] >= 0], key=lambda x: x[1])
-    if keep_last > 0 and len(files_epochs) > keep_last:
-        to_delete = [f for f, _ in files_epochs[:-keep_last]]
-        for f in to_delete:
-            try:
-                os.remove(f)
-            except Exception as e:
-                print(f"Warning: could not remove old model {f}: {e}", file=sys.stderr)
 
 
 # === Model loading function ===
@@ -182,16 +137,9 @@ def main():
         sys.exit(1)
 
     if args.torch_single_core:
-        torch.set_num_threads(1)
+        set_torch_single_core()
 
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
-        try:
-            import random
-            random.seed(args.seed)
-        except ImportError:
-            pass
+    set_seed(args.seed)
 
     cfg = {
         'num_users': args.users,
@@ -236,40 +184,6 @@ def main():
         def forward(self, x):          # x: [input_dim] = [input_obs_dim]
             return self.net(x)         # [num_slots] logits
 
-    def sample_actions_user(logits_user):
-        """Bernoulli per slot for one user; allows 0,1,2,... slots."""
-        d = torch.distributions.Bernoulli(logits=logits_user)
-        a = d.sample()                         # [num_slots] {0,1}
-        lp = d.log_prob(a).sum()               # scalar log-prob for this user
-        slots = torch.where(a == 1)[0].tolist()
-        return (len(slots), slots), lp, a      # (r,[slots]), logprob, tensor
-
-    # === SIC (single-round) ===
-    def run_sic_simulation(actions):
-        """
-        actions: list of length num_users; each element is (r, [slot indices in 0..num_slots-1])
-        returns: set of decoded user ids
-        """
-        slots = [[] for _ in range(cfg['num_slots'])]
-        for user_id, (r, slot_list) in enumerate(actions):
-            for s in slot_list[:r]:
-                slots[s].append(user_id)
-
-        decoded_users = set()
-        progress = True
-        while progress:
-            progress = False
-            for s in range(cfg['num_slots']):
-                if len(slots[s]) == 1:
-                    u = slots[s][0]
-                    if u not in decoded_users:
-                        decoded_users.add(u)
-                        for t in range(cfg['num_slots']):
-                            if u in slots[t]:
-                                slots[t].remove(u)
-                        progress = True
-        return decoded_users
-
     # ---- expose config values as locals for train() closure ----
     epochs = cfg['epochs']
     batch_size = cfg['batch_size']
@@ -307,7 +221,7 @@ def main():
                 acts_bin = torch.stack(acts_bin, dim=0)  # [num_users, num_slots]
 
                 # ----- Decode once -----
-                decoded = run_sic_simulation(actions)
+                decoded = run_sic_simulation(actions, num_slots)
                 num_decoded = len(decoded)
                 reward = num_decoded / num_users
 

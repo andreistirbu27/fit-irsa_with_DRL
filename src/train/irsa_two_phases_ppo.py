@@ -31,7 +31,6 @@ DEFAULT_EPOCHS = 2000
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_LEARNING_RATE = 3e-4
 DEFAULT_KEEP_LAST_MODELS = 2
-DEFAULT_SEED = 1000
 
 # PPO defaults
 DEFAULT_CLIP_EPS = 0.2
@@ -49,8 +48,8 @@ DEFAULT_MAX_GRAD_NORM = 0.5
 # =========================
 def parse_args():
     parser = argparse.ArgumentParser(description="IRSA 2-Phases Training (PPO)")
-    parser.add_argument('--users', type=int, default=3, help='Number of users (required)')
-    parser.add_argument('--slots', type=int, default=3, help='Number of slots (required)')
+    parser.add_argument('--users', type=int, required=True, help='Number of users')
+    parser.add_argument('--slots', type=int, required=True, help='Number of slots')
     parser.add_argument('--torch-single-core', default=False, action="store_true")
     parser.add_argument('--input-obs-dim', type=int, default=3)
     parser.add_argument('--hidden-dim', type=int, default=DEFAULT_HIDDEN_DIM)
@@ -65,7 +64,7 @@ def parse_args():
     parser.add_argument('--result-dir', type=str, default=None, help='Override result dir')
     parser.add_argument('--keep-last-models', type=int, default=DEFAULT_KEEP_LAST_MODELS,
                         help='Keep only the last X saved models (default=2)')
-    parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help='Random seed (default=1000)')
+    parser.add_argument('--seed', type=int, required=True, help='Random seed')
 
     # PPO-specific
     parser.add_argument('--clip-eps', type=float, default=DEFAULT_CLIP_EPS)
@@ -101,8 +100,7 @@ def make_result_dir(cfg):
             parts.append(f"b{cfg['batch_size']}")
         if cfg['learning_rate'] != DEFAULT_LEARNING_RATE:
             parts.append(f"lr{cfg['learning_rate']}")
-        if cfg.get('seed', DEFAULT_SEED) != DEFAULT_SEED:
-            parts.append(f"s{cfg['seed']}")
+        parts.append(f"seed{cfg['seed']}")
         result_dir = "-".join(parts)
         result_dir = under_results(result_dir)
     os.makedirs(result_dir, exist_ok=True)
@@ -319,14 +317,14 @@ def train_ppo(model, optimizer, cfg,
                 lp_r1_total = lp_r1_total + lp_u
                 r1_vals.append(v_u)
 
-                # store step (non-terminal yet)
+                # Per-user bandit: every step is its own one-step episode (dones=1),
+                # reward filled in after the joint decode below.
                 obs_buf.append(x1)
                 act_bin_buf.append(a_u)
                 old_logp_buf.append(lp_u.detach())
                 val_buf.append(v_u.detach())
-                # zero reward now; terminal reward after concat decode
                 rew_buf.append(torch.tensor(0.0))
-                done_buf.append(torch.tensor(0.0))  # not done
+                done_buf.append(torch.tensor(1.0))
 
             acts_bin_r1 = torch.stack(acts_bin_r1, dim=0)
             decoded_r1, fb_idx = run_sic_simulation(actions_r1, num_slots, return_feedback_indices=True)
@@ -347,13 +345,12 @@ def train_ppo(model, optimizer, cfg,
                 lp_r2_total = lp_r2_total + lp_u
                 r2_vals.append(v_u)
 
-                # store step (still not terminal yet)
                 obs_buf.append(x2)
                 act_bin_buf.append(a_u)
                 old_logp_buf.append(lp_u.detach())
                 val_buf.append(v_u.detach())
                 rew_buf.append(torch.tensor(0.0))
-                done_buf.append(torch.tensor(0.0))
+                done_buf.append(torch.tensor(1.0))
 
             acts_bin_r2 = torch.stack(acts_bin_r2, dim=0)
 
@@ -385,10 +382,11 @@ def train_ppo(model, optimizer, cfg,
             else:
                 frac_decR1_txR2 = float('nan')
 
-            # Assign the terminal reward to the LAST step of this episode
-            # Episode length = 2*num_users steps.
-            rew_buf[-1] = torch.tensor(reward_adjusted)
-            done_buf[-1] = torch.tensor(1.0)
+            # Per-user bandit: write the joint global reward to each of the
+            # 2*num_users one-step episodes just collected.
+            episode_len = 2 * num_users
+            for k in range(episode_len):
+                rew_buf[-episode_len + k] = torch.tensor(reward_adjusted)
 
             batch_uniques.append(num_decoded_concat)
             batch_frac_decR1_txR2.append(frac_decR1_txR2)
