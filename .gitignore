@@ -6,4 +6,9 @@ __pycache__/
 *.md
 results/legacy/
 paper/
+figs/
 *.txt
+
+# training artefacts — keep logs, skip weights and per-run configs
+results/new/**/*.pt
+results/new/*/config.json
