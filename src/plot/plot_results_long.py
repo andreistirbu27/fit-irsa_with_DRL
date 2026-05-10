@@ -185,7 +185,7 @@ def parse_run_dir(dirname):
 
 
 def collect_runs(results_dir='results/new'):
-    """Scan results_dir and return a list of metadata dicts for all parseable run dirs."""
+    """Scan results_dir for parseable run dirs, recursing one level into sweep-group folders."""
     runs = []
     if not os.path.isdir(results_dir):
         return runs
@@ -196,6 +196,14 @@ def collect_runs(results_dir='results/new'):
         meta = parse_run_dir(full)
         if meta is not None:
             runs.append(meta)
+        else:
+            for child in os.listdir(full):
+                child_full = os.path.join(full, child)
+                if not os.path.isdir(child_full):
+                    continue
+                child_meta = parse_run_dir(child_full)
+                if child_meta is not None:
+                    runs.append(child_meta)
     return runs
 
 
@@ -338,6 +346,77 @@ def _group_key(meta, sweep):
     return (meta['variant'], meta['prefix'], meta['users'], meta['slots'])
 
 
+def _total_slots(meta):
+    """Total frame size for a run.
+    """
+    v = meta['variant']
+    if v == '2p' or v == '2p-ppo' or v == '2p-2x64':
+        return 2 * meta['slots']
+    if v == 'kp':
+        return meta['num_phases'] * meta['slots']
+    return meta['slots']
+
+
+def _check_total_slots_match(runs, sweep, strict=True):
+    """Verify total frame size matches across variants at each user count.
+    """
+    from collections import defaultdict
+    if sweep == 'var-users-kphase':
+        # Group by users; require all (k, slots) pairs to give the same total
+        by_u = defaultdict(set)
+        for r in runs:
+            by_u[r['users']].add((r['num_phases'], _total_slots(r)))
+    else:
+        by_u = defaultdict(set)
+        for r in runs:
+            by_u[r['users']].add((r['variant'], _total_slots(r)))
+
+    bad = []
+    for u, pairs in sorted(by_u.items()):
+        totals = {t for _, t in pairs}
+        if len(totals) > 1:
+            bad.append((u, sorted(pairs)))
+    if not bad:
+        return
+    msg_lines = [f"Total-frame mismatch ({sweep}): variants at the same user count have different total slot budgets:"]
+    for u, pairs in bad:
+        msg_lines.append(f"  u={u}: " + ", ".join(f"{tag}={t} slots" for tag, t in pairs))
+    msg = "\n".join(msg_lines)
+    if strict:
+        raise RuntimeError(msg + "\nFix the sweep so total frames match, or pass strict_total_slots=False to compare anyway.")
+    else:
+        print("WARNING: " + msg)
+
+
+def _check_no_slot_ambiguity(runs, sweep):
+    from collections import defaultdict
+    if sweep == 'var-users-kphase':
+        ident_keys = ('variant', 'users', 'num_phases')
+    else:
+        ident_keys = ('variant', 'prefix', 'users')
+    by_ident = defaultdict(set)
+    by_ident_paths = defaultdict(list)
+    for r in runs:
+        ident = tuple(r[k] for k in ident_keys)
+        by_ident[ident].add(r['slots'])
+        by_ident_paths[ident].append(r['path'])
+    bad = {k: v for k, v in by_ident.items() if len(v) > 1}
+    if not bad:
+        return
+    lines = [f"Refusing to plot: multiple slot values for the same {ident_keys}:"]
+    for k, slots in sorted(bad.items()):
+        lines.append(f"  {dict(zip(ident_keys, k))}  slots={sorted(slots)}")
+        for p in sorted(by_ident_paths[k])[:4]:
+            lines.append(f"    - {p}")
+        if len(by_ident_paths[k]) > 4:
+            lines.append(f"    ... and {len(by_ident_paths[k]) - 4} more")
+    lines.append(
+        "Resolve by moving the stale runs out of results/new/ "
+        "(e.g. into results/legacy/) and re-running."
+    )
+    raise RuntimeError("\n".join(lines))
+
+
 def plot_throughput_across_seeds(
     sweep,
     results_dir='results/new',
@@ -347,6 +426,7 @@ def plot_throughput_across_seeds(
     xlim=None,
     ylim=None,
     out=None,
+    strict_total_slots=True,
 ):
     """Bar chart of throughput vs users with across-seed t-distribution CIs.
 
@@ -361,18 +441,32 @@ def plot_throughput_across_seeds(
         runs = [r for r in all_runs if r['prefix'] == 'load' and r['variant'] in ('1p', '2p')]
     elif sweep == 'var-users-kphase':
         runs = [r for r in all_runs if r['variant'] == 'kp']
+    elif sweep.startswith('matched-'):
+        prefix = sweep[len('matched-'):]
+        runs = [r for r in all_runs if r['prefix'] == prefix and r['variant'] in ('1p', '2p', 'kp')]
+        # Inject implicit num_phases for 1p / 2p so downstream code can group by k.
+        for r in runs:
+            if r['variant'] == '1p':
+                r['num_phases'] = 1
+            elif r['variant'] == '2p':
+                r['num_phases'] = 2
     else:
-        raise ValueError(f"Unknown sweep: {sweep!r}. Use var-users, var-load, or var-users-kphase.")
+        raise ValueError(f"Unknown sweep: {sweep!r}. Use var-users, var-load, var-users-kphase, or matched-<prefix>.")
 
     if not runs:
         print(f"No runs found for sweep={sweep!r} in {results_dir}")
         return
 
+    check_sweep = 'var-users-kphase' if sweep.startswith('matched-') else sweep
+    _check_no_slot_ambiguity(runs, check_sweep)
+    _check_total_slots_match(runs, check_sweep, strict=strict_total_slots)
+
     # Group runs by config (excluding seed)
     from collections import defaultdict
     groups = defaultdict(list)
+    group_sweep = 'var-users-kphase' if sweep.startswith('matched-') else sweep
     for r in runs:
-        k = _group_key(r, sweep)
+        k = _group_key(r, group_sweep)
         groups[k].append(r)
 
     # Compute per-group across-seed CI
@@ -401,8 +495,8 @@ def plot_throughput_across_seeds(
         return
 
     # Extract sorted user counts and variant display names
-    if sweep == 'var-users-kphase':
-        all_keys = sorted(group_stats.keys(), key=lambda k: (k[0], k[3], k[1]))
+    if sweep == 'var-users-kphase' or sweep.startswith('matched-'):
+        all_keys = sorted(group_stats.keys(), key=lambda k: (k[3], k[1]))
         phase_values = sorted(set(k[3] for k in all_keys))
         user_values = sorted(set(k[1] for k in all_keys))
         x = np.array(user_values)
@@ -415,9 +509,8 @@ def plot_throughput_across_seeds(
         for ci_idx, k_phases in enumerate(phase_values):
             avgs, errs, xs = [], [], []
             for u in user_values:
-                key = ('kp', u, None, k_phases)
-                # find matching key (slots may vary)
-                match = [g for g in group_stats if g[0] == 'kp' and g[1] == u and g[3] == k_phases]
+                # Match by (users, num_phases); variant may differ in matched-* mode.
+                match = [g for g in group_stats if g[1] == u and g[3] == k_phases]
                 if match:
                     mean, ci_val, _ = group_stats[match[0]]
                     if normalize:
@@ -501,6 +594,7 @@ def plot_throughput_per_seed(
     xlim=None,
     ylim=None,
     out=None,
+    strict_total_slots=True,
 ):
     """Bar chart matching conference paper style: one bar cluster per seed."""
     all_runs = collect_runs(results_dir)
@@ -513,6 +607,9 @@ def plot_throughput_per_seed(
         runs = [r for r in all_runs if r['variant'] == 'kp']
     else:
         raise ValueError(f"Unknown sweep: {sweep!r}")
+
+    _check_no_slot_ambiguity(runs, sweep)
+    _check_total_slots_match(runs, sweep, strict=strict_total_slots)
 
     seeds = sorted(set(r['seed'] for r in runs))
     all_users = sorted(set(r['users'] for r in runs))
@@ -586,8 +683,10 @@ def _parse_args_cli():
     p = argparse.ArgumentParser(description="Plot throughput vs users/load from sweep results")
     p.add_argument('--ci-mode', choices=['per-seed', 'across-seed'], default='across-seed',
                    help='CI aggregation mode (default: across-seed for journal version)')
-    p.add_argument('--sweep', choices=['var-users', 'var-load', 'var-users-kphase'], default='var-users',
-                   help='Which sweep to plot')
+    p.add_argument('--sweep', default='var-users',
+                   help='Which sweep to plot: var-users | var-load | var-users-kphase | matched-<prefix> '
+                        '(e.g. matched-m24 for the matched-frame M=24 sweep). matched-* groups by k '
+                        'and requires every k value at each user count to share the same total slot budget.')
     p.add_argument('--results-dir', default='results/new',
                    help='Directory containing run subdirectories (default: results/new)')
     p.add_argument('--normalize', action='store_true',
@@ -598,6 +697,8 @@ def _parse_args_cli():
     p.add_argument('--ylim', nargs=2, type=float, default=None, metavar=('YMIN', 'YMAX'))
     p.add_argument('--legacy', action='store_true',
                    help='Run legacy (conference paper) plots from results/res-long/')
+    p.add_argument('--allow-frame-mismatch', action='store_true',
+                   help='Permit plotting variants whose total frame size disagrees at the same user count (warns instead of erroring). Use only for diagnostic plots; the comparison is unfair.')
     return p.parse_args()
 
 
@@ -624,6 +725,7 @@ def main():
         xlim=tuple(args.xlim) if args.xlim else None,
         ylim=tuple(args.ylim) if args.ylim else None,
         out=args.out,
+        strict_total_slots=not args.allow_frame_mismatch,
     )
 
     if args.ci_mode == 'across-seed':
