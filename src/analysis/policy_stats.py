@@ -42,18 +42,20 @@ from src.irsa_common.sic import (
 # ============================================================
 
 def _load_model_any(result_dir, which='final', device=None):
-    """Load any trained policy from result_dir → (policy, cfg)."""
-    config_path = os.path.join(result_dir, 'config.json')
-    with open(config_path) as f:
-        cfg = json.load(f)
+    """Load any trained policy from result_dir → (policy, cfg).
 
-    name = os.path.basename(result_dir)
-    if name.startswith('res-kp') or 'num_phases' in cfg:
-        from src.train.irsa_k_phase import load_model_from_dir
-    elif 'clip_eps' in cfg:
+    Dispatches by the dirname's variant prefix (no longer reads config.json
+    directly — the per-run config.json is dropped after migrate_results.py).
+    """
+    name = os.path.basename(os.path.abspath(result_dir))
+    if name.startswith('res-2p-ppo'):
         from src.train.irsa_two_phases_ppo import load_model_from_dir
-    elif 'num_layers' in cfg:
+    elif name.startswith('res-1p-ppo'):
+        from src.train.irsa_one_phase_ppo import load_model_from_dir
+    elif name.startswith('res-2p-2x64'):
         from src.train.irsa_2phase_2x64 import load_model_from_dir
+    elif name.startswith('res-kp'):
+        from src.train.irsa_k_phase import load_model_from_dir
     elif name.startswith('res-1p'):
         from src.train.irsa_one_phase import load_model_from_dir
     else:

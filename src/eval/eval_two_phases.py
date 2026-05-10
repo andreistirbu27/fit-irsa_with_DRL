@@ -11,14 +11,11 @@ from src.irsa_common.sic import sample_actions_user
 
 
 def _load_two_phase_model(result_dir, which="final", device=None):
-    """Dispatch to the correct loader based on the run's config.json."""
-    import json
-    config_path = os.path.join(result_dir, "config.json")
-    with open(config_path) as f:
-        cfg_peek = json.load(f)
-    if "clip_eps" in cfg_peek:
+    """Dispatch to the correct 2-phase loader based on the dirname's variant tag."""
+    name = os.path.basename(os.path.abspath(result_dir))
+    if name.startswith("res-2p-ppo"):
         from src.train.irsa_two_phases_ppo import load_model_from_dir
-    elif "num_layers" in cfg_peek:
+    elif name.startswith("res-2p-2x64"):
         from src.train.irsa_2phase_2x64 import load_model_from_dir
     else:
         from src.train.irsa_two_phases import load_model_from_dir
