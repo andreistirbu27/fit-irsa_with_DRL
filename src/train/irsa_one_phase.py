@@ -70,6 +70,23 @@ def make_result_dir(cfg):
     return result_dir
 
 
+class PolicyNetUser(nn.Module):
+    def __init__(self, input_obs_dim, hidden_dim, num_slots):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_obs_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_slots)
+        )
+        with torch.no_grad():
+            last = self.net[-1]
+            if isinstance(last, nn.Linear):
+                last.bias.fill_(-1.4)
+
+    def forward(self, x):
+        return self.net(x)
+
+
 # === Model loading function ===
 def load_model_from_dir(result_dir, which="final", device=None):
     from src.irsa_common.io import load_model
@@ -121,23 +138,6 @@ def main():
         json.dump(cfg, f, indent=2)
 
     log_f, log_path = get_log_file(result_dir, cfg['compress'])
-
-    # === Single-user policy ===
-    class PolicyNetUser(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, cfg['hidden_dim']),
-                nn.ReLU(),
-                nn.Linear(cfg['hidden_dim'], cfg['num_slots'])   # logits per slot for THIS user
-            )
-            with torch.no_grad():
-                last = self.net[-1]
-                if isinstance(last, nn.Linear):
-                    last.bias.fill_(-1.4)  # optional: start sparser (sigmoid ~0.2)
-
-        def forward(self, x):          # x: [input_dim] = [input_obs_dim]
-            return self.net(x)         # [num_slots] logits
 
     # ---- expose config values as locals for train() closure ----
     epochs = cfg['epochs']
@@ -227,7 +227,7 @@ def main():
         return reward_history, avg_decoded_history, dummy_hist
 
     # === Run ===
-    policy = PolicyNetUser()
+    policy = PolicyNetUser(cfg['input_obs_dim'], cfg['hidden_dim'], cfg['num_slots'])
     optimizer = optim.Adam(policy.parameters(), lr=cfg['learning_rate'])
     try:
         rewards, avg_decoded, _ = train(policy, optimizer)
